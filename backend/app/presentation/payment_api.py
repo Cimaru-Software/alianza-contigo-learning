@@ -10,11 +10,11 @@ from decimal import Decimal
 
 from flask import Blueprint, current_app, jsonify, redirect, request
 from flask_jwt_extended import get_jwt_identity
-from sqlalchemy import func
+from sqlalchemy import func, select
 from werkzeug.utils import secure_filename
 
-from app.extensions import db
-from app.infrastructure.email_service import branded_html, send_html
+from app.extensions import db, limiter
+from app.infrastructure.email_service import branded_html, send_html_later
 from app.infrastructure.persistence.models import CourseModel, EnrollmentModel, PaymentOrderModel, UserModel
 from app.presentation.auth_api import role_required
 
@@ -34,7 +34,13 @@ def serialize_order(order):
     return {"id": str(order.id), "reference": order.reference, "courseName": order.course.name, "courseSlug": order.course.slug, "studentName": f"{order.student.first_name} {order.student.last_name}", "studentEmail": order.student.email, "paymentMethod": order.payment_method, "provider": order.provider, "providerTransactionId": order.provider_transaction_id, "currency": order.currency, "amount": float(order.amount), "status": order.status, "proofUrl": order.proof_url, "rejectionComment": order.rejection_comment, "createdAt": order.created_at.isoformat(), "paidAt": order.paid_at.isoformat() if order.paid_at else None}
 
 
+def lock_student(student_id):
+    """Serialize checkouts and enrollments of one student so concurrent requests cannot duplicate them."""
+    db.session.execute(select(UserModel.id).where(UserModel.id == student_id).with_for_update())
+
+
 def ensure_available(course_slug, student):
+    lock_student(student.id)
     course = CourseModel.query.filter_by(slug=course_slug, status="ACTIVO").first()
     if not course:
         return None, (jsonify({"message": "Este curso no está disponible."}), 404)
@@ -47,18 +53,12 @@ def ensure_available(course_slug, student):
 
 
 def enroll(course, student):
+    lock_student(student.id)
     enrollment = EnrollmentModel.query.filter_by(course_id=course.id, student_id=student.id).first()
     if not enrollment:
         enrollment = EnrollmentModel(course_id=course.id, student_id=student.id)
         db.session.add(enrollment)
     return enrollment
-
-
-def safe_send(to, subject, html):
-    try:
-        send_html(to, subject, html)
-    except Exception:
-        current_app.logger.exception("No se pudo enviar el correo %s", subject)
 
 
 def clean(value):
@@ -72,6 +72,7 @@ def bank_details():
 
 
 @payment_api.post("/card")
+@limiter.limit("20 per hour")
 @role_required("student")
 def card_checkout():
     student = current_user()
@@ -101,14 +102,16 @@ def payphone_result(transaction_id, client_tx_id):
 
 
 @payment_api.post("/payphone/confirm")
+@limiter.limit("30 per hour")
 @role_required("student")
 def payphone_confirm():
     data = request.get_json(silent=True) or {}
     if not isinstance(data, dict):
         return jsonify({"message": "Datos de confirmación inválidos."}), 400
-    client_tx_id = data.get("clientTransactionId", "")
+    client_tx_id = str(data.get("clientTransactionId", ""))
     transaction_id = str(data.get("id", ""))
-    order = PaymentOrderModel.query.filter_by(reference=client_tx_id, provider="PAYPHONE", student_id=current_user().id).first()
+    # Locked so a repeated confirmation (refresh, double click) waits for the first one to finish.
+    order = PaymentOrderModel.query.filter_by(reference=client_tx_id, provider="PAYPHONE", student_id=current_user().id).with_for_update().first()
     if not order or not transaction_id.isdecimal() or int(transaction_id) <= 0:
         return jsonify({"message": "No encontramos esta transacción PayPhone."}), 400
     status = confirm_payphone_order(order, transaction_id)
@@ -169,7 +172,7 @@ def confirm_payphone_order(order, transaction_id):
         order.reviewed_at = order.paid_at
         enroll(order.course, order.student)
         db.session.commit()
-        safe_send(order.student.email, "Tu inscripción está activa — Alianza Contigo", branded_html("¡Pago aprobado!", f"Hola {clean(order.student.first_name)},", f"Tu pago de <strong>${order.amount}</strong> para <strong>{clean(order.course.name)}</strong> fue aprobado. Ya puedes comenzar a estudiar.", "Ir a mi curso", f'{current_app.config["FRONTEND_URL"]}/app/classroom/{order.course.slug}'))
+        send_html_later(order.student.email, "Tu inscripción está activa — Alianza Contigo", branded_html("¡Pago aprobado!", f"Hola {clean(order.student.first_name)},", f"Tu pago de <strong>${order.amount}</strong> para <strong>{clean(order.course.name)}</strong> fue aprobado. Ya puedes comenzar a estudiar.", "Ir a mi curso", f'{current_app.config["FRONTEND_URL"]}/app/classroom/{order.course.slug}'))
         return "approved"
     if confirmation.get("statusCode") == 2 or confirmation.get("transactionStatus") == "Canceled":
         order.status = "REJECTED"
@@ -183,8 +186,13 @@ def confirm_payphone_order(order, transaction_id):
 
 
 @payment_api.post("/transfer")
+@limiter.limit("10 per hour")
 @role_required("student")
 def transfer_checkout():
+    max_mb = current_app.config.get("MAX_DOCUMENT_UPLOAD_MB", 25)
+    if request.content_length and request.content_length > max_mb * 1024 * 1024:
+        return jsonify({"message": f"El comprobante supera el límite de {max_mb} MB."}), 413
+    request.max_content_length = max_mb * 1024 * 1024
     student = current_user()
     course, failure = ensure_available(request.form.get("courseSlug"), student)
     if failure:
@@ -201,8 +209,8 @@ def transfer_checkout():
     order = PaymentOrderModel(reference=f"TRF-{uuid.uuid4().hex[:10].upper()}", course=course, student=student, payment_method="TRANSFER", provider="BANK_TRANSFER", currency="USD", amount=final_price(course), status="PENDING", proof_url=f"/api/v1/uploads/{filename}")
     db.session.add(order)
     db.session.commit()
-    safe_send(current_app.config["MAIL_RECIPIENT"], f"Transferencia por validar · {order.reference}", branded_html("Nuevo comprobante por validar", "Hola equipo administrativo,", f"<strong>{clean(student.first_name)} {clean(student.last_name)}</strong> registró una transferencia de <strong>${order.amount}</strong> para <strong>{clean(course.name)}</strong>.<br>Referencia: {order.reference}", "Validar comprobante", f'{current_app.config["FRONTEND_URL"]}/admin/enrollments'))
-    safe_send(student.email, "Reserva registrada — Alianza Contigo", branded_html("Recibimos tu comprobante", f"Hola {clean(student.first_name)},", f"Registramos tu reserva para <strong>{clean(course.name)}</strong>. Administración validará el pago en un plazo máximo de 24 horas. Te notificaremos cuando puedas empezar a estudiar.<br>Referencia: {order.reference}"))
+    send_html_later(current_app.config["MAIL_RECIPIENT"], f"Transferencia por validar · {order.reference}", branded_html("Nuevo comprobante por validar", "Hola equipo administrativo,", f"<strong>{clean(student.first_name)} {clean(student.last_name)}</strong> registró una transferencia de <strong>${order.amount}</strong> para <strong>{clean(course.name)}</strong>.<br>Referencia: {order.reference}", "Validar comprobante", f'{current_app.config["FRONTEND_URL"]}/admin/enrollments'))
+    send_html_later(student.email, "Reserva registrada — Alianza Contigo", branded_html("Recibimos tu comprobante", f"Hola {clean(student.first_name)},", f"Registramos tu reserva para <strong>{clean(course.name)}</strong>. Administración validará el pago en un plazo máximo de 24 horas. Te notificaremos cuando puedas empezar a estudiar.<br>Referencia: {order.reference}"))
     return jsonify({"message": "Comprobante recibido. Validaremos tu pago en un plazo máximo de 24 horas.", "reference": order.reference}), 201
 
 
@@ -268,7 +276,10 @@ def payment_summary():
 @payment_api.patch("/orders/<order_id>")
 @role_required("admin")
 def review_order(order_id):
-    order = db.session.get(PaymentOrderModel, uuid.UUID(order_id))
+    try:
+        order = db.session.get(PaymentOrderModel, uuid.UUID(order_id), with_for_update=True)
+    except ValueError:
+        order = None
     if not order or order.status != "PENDING" or order.payment_method != "TRANSFER":
         return jsonify({"message": "Este pedido ya fue procesado o no existe."}), 400
     data = request.get_json(silent=True) or {}
@@ -291,5 +302,5 @@ def review_order(order_id):
         return jsonify({"message": "Decisión no válida."}), 400
     order.reviewed_at = datetime.now(timezone.utc)
     db.session.commit()
-    safe_send(order.student.email, subject, html)
+    send_html_later(order.student.email, subject, html)
     return jsonify(serialize_order(order))

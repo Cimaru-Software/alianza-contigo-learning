@@ -6,20 +6,13 @@ from html import escape
 from flask import Blueprint, current_app, jsonify, request, send_file
 from flask_jwt_extended import get_jwt_identity
 
-from app.extensions import db
-from app.infrastructure.email_service import branded_html, send_html
+from app.extensions import db, limiter
+from app.infrastructure.email_service import branded_html, send_html_later
 from app.infrastructure.certificate_pdf import build_certificate_pdf
 from app.infrastructure.persistence.models import ExamAttemptModel, EnrollmentModel, UserModel
 from app.presentation.auth_api import role_required
 
 exam_api = Blueprint("exams", __name__)
-
-
-def safe_send(to, subject, html):
-    try:
-        send_html(to, subject, html)
-    except Exception:
-        current_app.logger.exception("No se pudo enviar el correo %s", subject)
 
 
 def course_lessons(enrollment):
@@ -91,12 +84,12 @@ def student_exam_state(enrollment):
     }
 
 
-def student_enrollment(enrollment_id):
+def student_enrollment(enrollment_id, lock=False):
     try:
         enrollment_uuid = uuid.UUID(enrollment_id)
     except ValueError:
         return None
-    enrollment = db.session.get(EnrollmentModel, enrollment_uuid)
+    enrollment = db.session.get(EnrollmentModel, enrollment_uuid, with_for_update=lock)
     if not enrollment or enrollment.student_id != uuid.UUID(get_jwt_identity()):
         return None
     return enrollment
@@ -153,6 +146,7 @@ def student_certificates():
 
 
 @exam_api.get("/student/certificates/<enrollment_id>/pdf")
+@limiter.limit("30 per hour")
 @role_required("student")
 def download_student_certificate(enrollment_id):
     enrollment = student_enrollment(enrollment_id)
@@ -180,9 +174,11 @@ def download_student_certificate(enrollment_id):
 
 
 @exam_api.post("/student/enrollments/<enrollment_id>/submit")
+@limiter.limit("10 per hour")
 @role_required("student")
 def submit_student_exam(enrollment_id):
-    enrollment = student_enrollment(enrollment_id)
+    # Locked so a double submit cannot create two attempts with the same number.
+    enrollment = student_enrollment(enrollment_id, lock=True)
     if not enrollment:
         return jsonify({"message": "No tienes acceso a esta evaluación."}), 404
     exam = enrollment.course.final_exam
@@ -248,7 +244,7 @@ def submit_student_exam(enrollment_id):
     student = enrollment.student
     course = enrollment.course
     if passed:
-        safe_send(
+        send_html_later(
             student.email,
             "¡Aprobaste tu curso! — Alianza Contigo",
             branded_html(
@@ -264,7 +260,7 @@ def submit_student_exam(enrollment_id):
     teachers = UserModel.query.filter_by(role="teacher", is_active=True).all()
     recipients = [teacher.email for teacher in teachers] or [current_app.config["MAIL_RECIPIENT"]]
     for recipient in recipients:
-        safe_send(
+        send_html_later(
             recipient,
             f"Examen reprobado pendiente de retroalimentación · {course.name}",
             branded_html(
@@ -347,7 +343,7 @@ def review_failed_attempt(attempt_id):
         if attempts_remaining
         else "Has utilizado todos los intentos disponibles. Comunícate con la academia para recibir orientación."
     )
-    safe_send(
+    send_html_later(
         enrollment.student.email,
         "Retroalimentación de tu examen final — Alianza Contigo",
         branded_html(

@@ -16,4 +16,4 @@ COPY --chown=alianza:alianza frontend/src/assets/logo_cert.png /app/app/assets/l
 USER alianza
 
 EXPOSE 5000
-CMD ["gunicorn", "--bind", "0.0.0.0:5000", "--workers", "2", "--threads", "4", "--timeout", "600", "--worker-tmp-dir", "/dev/shm", "wsgi:app"]
+CMD ["gunicorn", "--bind", "0.0.0.0:5000", "--workers", "2", "--threads", "8", "--timeout", "600", "--worker-tmp-dir", "/dev/shm", "wsgi:app"]

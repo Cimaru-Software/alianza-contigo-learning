@@ -36,6 +36,26 @@ class BaseConfig:
     BANK_ACCOUNT_ID = os.getenv("BANK_ACCOUNT_ID", "0195185840001")
     PAYPHONE_STORE_ID = os.getenv("PAYPHONE_STORE_ID", "")
     PAYPHONE_TOKEN = os.getenv("PAYPHONE_TOKEN", "")
+    # Pool sized for gunicorn threads per worker; pre-ping drops connections Postgres closed.
+    SQLALCHEMY_ENGINE_OPTIONS = {
+        "pool_pre_ping": True,
+        "pool_recycle": 1800,
+        "pool_size": int(os.getenv("DB_POOL_SIZE", "10")),
+        "max_overflow": int(os.getenv("DB_MAX_OVERFLOW", "10")),
+        "pool_timeout": int(os.getenv("DB_POOL_TIMEOUT", "10")),
+    }
+    # Number of reverse proxies (Caddy) in front of the API whose X-Forwarded-For is trusted.
+    TRUSTED_PROXY_COUNT = int(os.getenv("TRUSTED_PROXY_COUNT", "0"))
+    EMAIL_ASYNC = os.getenv("EMAIL_ASYNC", "true").lower() == "true"
+    RATELIMIT_ENABLED = os.getenv("RATELIMIT_ENABLED", "true").lower() == "true"
+    # Use redis:// in production so every gunicorn worker shares the same counters.
+    RATELIMIT_STORAGE_URI = os.getenv("RATELIMIT_STORAGE_URI", "memory://")
+    # Short timeouts so a stalled Redis degrades to in-memory limits instead of hanging requests.
+    RATELIMIT_STORAGE_OPTIONS = {"socket_connect_timeout": 0.5, "socket_timeout": 0.5} if RATELIMIT_STORAGE_URI.startswith("redis") else {}
+    RATELIMIT_DEFAULT = os.getenv("RATELIMIT_DEFAULT", "600 per minute")
+    # Per-IP limits sized so a whole classroom behind one public IP can register at once.
+    RATELIMIT_REGISTER = os.getenv("RATELIMIT_REGISTER", "40 per minute;400 per hour")
+    RATELIMIT_LOGIN = os.getenv("RATELIMIT_LOGIN", "60 per minute;1000 per hour")
 
 
 class DevelopmentConfig(BaseConfig):
@@ -51,7 +71,12 @@ class ProductionConfig(BaseConfig):
     SQLALCHEMY_DATABASE_URI = os.getenv("DATABASE_URL", "")
 
 
+INSECURE_JWT_SECRETS = {"", "change-this-development-secret", "development-only-change-me", "replace-with-at-least-64-random-characters"}
+
+
 def get_config():
     if os.getenv("FLASK_ENV") == "production" and not ProductionConfig.SQLALCHEMY_DATABASE_URI:
         raise RuntimeError("DATABASE_URL is required in production")
+    if os.getenv("FLASK_ENV") == "production" and ProductionConfig.JWT_SECRET_KEY in INSECURE_JWT_SECRETS:
+        raise RuntimeError("JWT_SECRET_KEY must be set to a random secret in production")
     return ProductionConfig if os.getenv("FLASK_ENV") == "production" else DevelopmentConfig

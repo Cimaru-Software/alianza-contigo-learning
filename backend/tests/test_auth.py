@@ -61,7 +61,7 @@ def test_password_recovery_uses_branded_html_button(monkeypatch):
     web = client()
     app = web.application
     sent = []
-    monkeypatch.setattr(auth_api, "send_html", lambda to, subject, html: sent.append((to, subject, html)) or True)
+    monkeypatch.setattr(auth_api, "send_html_later", lambda to, subject, html: sent.append((to, subject, html)))
     with app.app_context():
         app.config["FRONTEND_URL"] = "http://localhost:5173"
         user = UserModel(first_name="Ana", last_name="Torres", email="ana@example.com", role="student")

@@ -10,22 +10,33 @@ from flask import Blueprint, current_app, jsonify, request, send_from_directory
 from werkzeug.utils import secure_filename
 from flask_jwt_extended import get_jwt_identity
 from markupsafe import escape
+from sqlalchemy import func
+from sqlalchemy.orm import selectinload
 
 from app.application.services.course_service import CourseService
-from app.extensions import db
+from app.extensions import client_ip, db, limiter
 from app.infrastructure.persistence.models import CourseModel, CourseModuleModel, EnrollmentModel, ExamAttemptModel, ExamQuestionModel, FinalExamModel, LessonModel, LessonProgressModel, PaymentOrderModel, TrainingAreaModel, UserModel
 from app.presentation.auth_api import role_required
 from app.infrastructure.email_service import branded_html, send_html
 
 ALLOWED_UPLOADS = {"pdf", "png", "jpg", "jpeg", "webp", "mp4", "webm"}
+# Load a course with everything serialize_course touches in a few queries instead of one per lesson.
+COURSE_TREE = (
+    selectinload(CourseModel.training_area),
+    selectinload(CourseModel.modules).selectinload(CourseModuleModel.lessons),
+    selectinload(CourseModel.final_exam).selectinload(FinalExamModel.questions),
+)
 
 
-def serialize_lesson(lesson):
+def serialize_lesson(lesson, public=False):
+    if public and not lesson.is_preview:
+        # Paid content (text, media URLs, activity answers) is only served to enrolled students.
+        return {"id": str(lesson.id), "title": lesson.title, "type": lesson.lesson_type, "content": "", "mediaUrl": None, "durationMinutes": lesson.duration_minutes, "isPreview": False, "interaction": None, "position": lesson.position}
     return {"id": str(lesson.id), "title": lesson.title, "type": lesson.lesson_type, "content": lesson.content, "mediaUrl": lesson.media_url, "durationMinutes": lesson.duration_minutes, "isPreview": lesson.is_preview, "interaction": lesson.interaction_data, "position": lesson.position}
 
 
-def serialize_module(module):
-    return {"id": str(module.id), "title": module.title, "description": module.description, "position": module.position, "lessons": [serialize_lesson(item) for item in module.lessons]}
+def serialize_module(module, public=False):
+    return {"id": str(module.id), "title": module.title, "description": module.description, "position": module.position, "lessons": [serialize_lesson(item, public) for item in module.lessons]}
 
 
 def serialize_exam(exam, include_answers=False):
@@ -40,12 +51,13 @@ def serialize_exam(exam, include_answers=False):
     return {"id": str(exam.id), "title": exam.title, "instructions": exam.instructions, "timeLimitMinutes": exam.time_limit_minutes, "attemptsAllowed": exam.attempts_allowed, "passingScore": exam.passing_score, "questions": questions}
 
 
-def serialize_course(course, detailed=False, include_answers=False):
+def serialize_course(course, detailed=False, include_answers=False, public=False):
     data = {"id": str(course.id), "slug": course.slug, "name": course.name, "shortDescription": course.short_description, "fullDescription": course.full_description, "coverUrl": course.cover_url, "modality": course.modality, "duration": course.duration, "certification": course.certification, "endorsement": course.endorsement, "price": float(course.price), "discountPercent": course.discount_percent, "finalPrice": round(float(course.price) * (100 - course.discount_percent) / 100, 2), "status": course.status, "modulesCount": len(course.modules), "lessonsCount": sum(len(item.lessons) for item in course.modules), "hasFinalExam": course.final_exam is not None and len(course.final_exam.questions) > 0}
     data["trainingArea"] = {"id": str(course.training_area.id), "name": course.training_area.name}
     if detailed:
-        data["modules"] = [serialize_module(item) for item in course.modules]
-        data["finalExam"] = serialize_exam(course.final_exam, include_answers)
+        data["modules"] = [serialize_module(item, public) for item in course.modules]
+        if not public:
+            data["finalExam"] = serialize_exam(course.final_exam, include_answers)
     return data
 
 
@@ -79,10 +91,12 @@ def create_api_blueprint(course_service: CourseService) -> Blueprint:
     api = Blueprint("api", __name__)
 
     @api.get("/health")
+    @limiter.exempt
     def health():
         return jsonify({"status": "ok", "service": "alianza-contigo-api"})
 
     @api.post("/contact")
+    @limiter.limit("10 per hour", key_func=client_ip)
     def contact():
         data = request.get_json(silent=True) or {}
         name = (data.get("name") or "").strip()
@@ -227,7 +241,7 @@ def create_api_blueprint(course_service: CourseService) -> Blueprint:
 
     @api.get("/courses")
     def list_courses():
-        rows = CourseModel.query.filter_by(status="ACTIVO").order_by(CourseModel.updated_at.desc()).all()
+        rows = CourseModel.query.options(*COURSE_TREE).filter_by(status="ACTIVO").order_by(CourseModel.updated_at.desc()).all()
         return jsonify([serialize_course(row) for row in rows])
 
     @api.get("/training-areas")
@@ -287,15 +301,15 @@ def create_api_blueprint(course_service: CourseService) -> Blueprint:
     @api.get("/courses/manage")
     @role_required("admin", "teacher")
     def manage_courses():
-        rows = CourseModel.query.order_by(CourseModel.updated_at.desc()).all()
+        rows = CourseModel.query.options(*COURSE_TREE).order_by(CourseModel.updated_at.desc()).all()
         return jsonify([serialize_course(row) for row in rows])
 
     @api.get("/courses/<slug>")
     def get_course(slug: str):
-        course = CourseModel.query.filter_by(slug=slug, status="ACTIVO").first()
+        course = CourseModel.query.options(*COURSE_TREE).filter_by(slug=slug, status="ACTIVO").first()
         if course is None:
             return jsonify({"error": "course_not_found", "message": "Programa no encontrado"}), 404
-        return jsonify(serialize_course(course, detailed=True))
+        return jsonify(serialize_course(course, detailed=True, public=True))
 
     @api.get("/courses/<slug>/author")
     @role_required("admin")
@@ -409,6 +423,7 @@ def create_api_blueprint(course_service: CourseService) -> Blueprint:
         return jsonify(serialize_exam(exam, True))
 
     @api.post("/uploads")
+    @limiter.limit("120 per hour")
     @role_required("admin")
     def upload_file():
         uploaded = request.files.get("file")
@@ -448,10 +463,20 @@ def create_api_blueprint(course_service: CourseService) -> Blueprint:
     @role_required("student")
     def student_enrollments():
         student_id = uuid.UUID(get_jwt_identity())
-        rows = EnrollmentModel.query.filter_by(student_id=student_id).order_by(EnrollmentModel.enrolled_at.desc()).all()
+        rows = (
+            EnrollmentModel.query.options(
+                selectinload(EnrollmentModel.course).options(*COURSE_TREE),
+                selectinload(EnrollmentModel.lesson_progress),
+                selectinload(EnrollmentModel.exam_attempts),
+            )
+            .filter_by(student_id=student_id)
+            .order_by(EnrollmentModel.enrolled_at.desc())
+            .all()
+        )
         return jsonify({"enrollments": [{"id": str(item.id), "course": serialize_course(item.course, detailed=True), "progressPercent": current_enrollment_progress(item), "completedLessonIds": [str(progress.lesson_id) for progress in item.lesson_progress], "examScore": float(item.exam_score) if item.exam_score is not None else None, "examStatus": current_exam_status(item), "completedAt": item.completed_at.isoformat() if item.completed_at else None, "enrolledAt": item.enrolled_at.isoformat()} for item in rows]})
 
     @api.post("/student/enrollments/<enrollment_id>/lessons/<lesson_id>/complete")
+    @limiter.limit("120 per minute")
     @role_required("student")
     def complete_lesson(enrollment_id, lesson_id):
         try:
@@ -459,7 +484,8 @@ def create_api_blueprint(course_service: CourseService) -> Blueprint:
             lesson_uuid = uuid.UUID(lesson_id)
         except ValueError:
             return jsonify({"message": "La lección no es válida."}), 404
-        enrollment = db.session.get(EnrollmentModel, enrollment_uuid)
+        # Locked so two quick clicks cannot insert the same lesson progress twice.
+        enrollment = db.session.get(EnrollmentModel, enrollment_uuid, with_for_update=True)
         if not enrollment or enrollment.student_id != uuid.UUID(get_jwt_identity()):
             return jsonify({"message": "No tienes acceso a esta matrícula."}), 404
         ordered = ordered_course_lessons(enrollment.course)
@@ -497,7 +523,8 @@ def create_api_blueprint(course_service: CourseService) -> Blueprint:
     @role_required("admin")
     def admin_students():
         students = UserModel.query.filter_by(role="student").order_by(UserModel.created_at.desc()).all()
-        return jsonify({"students": [{**student.to_dict(), "createdAt": student.created_at.isoformat(), "coursesCount": EnrollmentModel.query.filter_by(student_id=student.id).count()} for student in students]})
+        counts = dict(db.session.query(EnrollmentModel.student_id, func.count(EnrollmentModel.id)).group_by(EnrollmentModel.student_id).all())
+        return jsonify({"students": [{**student.to_dict(), "createdAt": student.created_at.isoformat(), "coursesCount": counts.get(student.id, 0)} for student in students]})
 
     @api.get("/admin/students/<student_id>")
     @role_required("admin")

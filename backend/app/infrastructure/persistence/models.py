@@ -1,8 +1,25 @@
+import hashlib
+import os
+import threading
 import uuid
 from datetime import datetime, timezone
 from werkzeug.security import check_password_hash, generate_password_hash
 
 from app.extensions import db
+
+# scrypt needs ~32 MB per hash; cap parallel hashes so a burst of sign-ups cannot exhaust RAM.
+_password_hashing = threading.BoundedSemaphore(int(os.getenv("PASSWORD_HASH_CONCURRENCY", "4")))
+_dummy_password_hash = None
+
+
+def check_dummy_password(password: str) -> bool:
+    """Spend the same time as a real check so login timing does not reveal registered emails."""
+    global _dummy_password_hash
+    with _password_hashing:
+        if _dummy_password_hash is None:
+            _dummy_password_hash = generate_password_hash(uuid.uuid4().hex, method="scrypt")
+        check_password_hash(_dummy_password_hash, password)
+    return False
 
 
 class TrainingAreaModel(db.Model):
@@ -182,10 +199,16 @@ class UserModel(db.Model):
     created_at = db.Column(db.DateTime(timezone=True), nullable=False, default=lambda: datetime.now(timezone.utc))
 
     def set_password(self, password: str) -> None:
-        self.password_hash = generate_password_hash(password, method="scrypt")
+        with _password_hashing:
+            self.password_hash = generate_password_hash(password, method="scrypt")
 
     def check_password(self, password: str) -> bool:
-        return check_password_hash(self.password_hash, password)
+        with _password_hashing:
+            return check_password_hash(self.password_hash, password)
+
+    def password_fingerprint(self) -> str:
+        """Changes whenever the password changes; used to expire reset links and old sessions."""
+        return hashlib.sha256(self.password_hash.encode()).hexdigest()[:16]
 
     def to_dict(self):
         return {

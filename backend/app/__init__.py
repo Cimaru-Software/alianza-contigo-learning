@@ -1,8 +1,9 @@
 from flask import Flask, jsonify
+from werkzeug.middleware.proxy_fix import ProxyFix
 import os
 
 from app.config import get_config
-from app.extensions import cors, db, jwt, migrate
+from app.extensions import cors, db, jwt, limiter, migrate
 from app.infrastructure.persistence.models import CourseModel, UserModel
 from app.infrastructure.persistence.repositories import SqlAlchemyCourseRepository
 from app.presentation.api import create_api_blueprint
@@ -17,10 +18,13 @@ from app.infrastructure.demo_seed import seed_demo_courses
 def create_app(config_object=None) -> Flask:
     app = Flask(__name__)
     app.config.from_object(config_object or get_config())
+    if app.config.get("TRUSTED_PROXY_COUNT"):
+        app.wsgi_app = ProxyFix(app.wsgi_app, x_for=app.config["TRUSTED_PROXY_COUNT"], x_proto=app.config["TRUSTED_PROXY_COUNT"])
 
     db.init_app(app)
     migrate.init_app(app, db)
     jwt.init_app(app)
+    limiter.init_app(app)
 
     @jwt.invalid_token_loader
     def invalid_token(reason):
@@ -37,6 +41,10 @@ def create_app(config_object=None) -> Flask:
     @app.errorhandler(413)
     def upload_too_large(_error):
         return jsonify({"message": "El archivo supera el tamaño máximo permitido."}), 413
+
+    @app.errorhandler(429)
+    def too_many_requests(_error):
+        return jsonify({"error": "rate_limited", "message": "Recibimos demasiadas solicitudes. Espera un momento e inténtalo nuevamente."}), 429
     cors.init_app(app, resources={r"/api/*": {"origins": app.config["CORS_ORIGINS"]}}, supports_credentials=True)
 
     repository = SqlAlchemyCourseRepository(db.session, CourseModel)

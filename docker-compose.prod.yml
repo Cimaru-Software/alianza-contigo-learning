@@ -61,6 +61,8 @@ services:
       FRONTEND_URL: https://${DOMAIN}
       CORS_ORIGINS: https://${DOMAIN}
       DATABASE_URL: postgresql+psycopg://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+      RATELIMIT_STORAGE_URI: redis://redis:6379/0
+      TRUSTED_PROXY_COUNT: "1"
     command:
       - sh
       - -c
@@ -68,7 +70,9 @@ services:
         flask --app wsgi:app db upgrade &&
         gunicorn --bind 0.0.0.0:5000
         --workers ${GUNICORN_WORKERS:-2}
-        --threads ${GUNICORN_THREADS:-4}
+        --threads ${GUNICORN_THREADS:-8}
+        --max-requests 2000
+        --max-requests-jitter 200
         --timeout 600
         --graceful-timeout 60
         --keep-alive 5
@@ -81,6 +85,8 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+      redis:
+        condition: service_started
     healthcheck:
       test:
         [
@@ -113,6 +119,20 @@ services:
       interval: 10s
       timeout: 5s
       retries: 10
+    networks:
+      - database
+    logging: *default-logging
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    # Only rate-limit counters live here: no persistence, small bounded memory.
+    command: ["redis-server", "--save", "", "--appendonly", "no", "--maxmemory", "64mb", "--maxmemory-policy", "volatile-ttl"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
     networks:
       - database
     logging: *default-logging

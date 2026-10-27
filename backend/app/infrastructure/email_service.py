@@ -1,9 +1,14 @@
+import os
 import smtplib
 import ssl
+from concurrent.futures import ThreadPoolExecutor
 from email.message import EmailMessage
 from html import escape
 
 from flask import current_app
+
+# Few workers on purpose: Gmail throttles parallel SMTP logins, and requests must not wait on SMTP.
+_mail_executor = ThreadPoolExecutor(max_workers=int(os.getenv("EMAIL_WORKERS", "3")), thread_name_prefix="mail")
 
 
 def branded_html(title, greeting, body, action_label=None, action_url=None):
@@ -51,3 +56,20 @@ def send_html(to, subject, html):
         smtp.login(current_app.config["EMAIL_ADDRESS"], current_app.config["EMAIL_PASSWORD"])
         smtp.send_message(message)
     return True
+
+
+def _deliver(app, to, subject, html):
+    with app.app_context():
+        try:
+            send_html(to, subject, html)
+        except Exception:
+            app.logger.exception("No se pudo enviar el correo %s", subject)
+
+
+def send_html_later(to, subject, html):
+    """Queue a best-effort email so the HTTP response does not wait for SMTP."""
+    app = current_app._get_current_object()
+    if app.testing or not app.config.get("EMAIL_ASYNC", True):
+        _deliver(app, to, subject, html)
+        return
+    _mail_executor.submit(_deliver, app, to, subject, html)
