@@ -109,9 +109,12 @@ const baseModules = (): Module[] => [
   },
 ];
 
+const MOCK_TRAINING_AREA = { id: "formacion-general", name: "Formación general" };
+
 export const courses: Course[] = [
   {
     id: "c1",
+    trainingArea: MOCK_TRAINING_AREA,
     slug: "gestor-empresarial",
     name: "Gestor Empresarial",
     shortDescription:
@@ -130,6 +133,7 @@ export const courses: Course[] = [
   },
   {
     id: "c2",
+    trainingArea: MOCK_TRAINING_AREA,
     slug: "administracion-de-empresas",
     name: "Administración de Empresas",
     shortDescription:
@@ -148,6 +152,7 @@ export const courses: Course[] = [
   },
   {
     id: "c3",
+    trainingArea: MOCK_TRAINING_AREA,
     slug: "agente-inmobiliario",
     name: "Agente Inmobiliario",
     shortDescription:
@@ -166,6 +171,7 @@ export const courses: Course[] = [
   },
   {
     id: "c4",
+    trainingArea: MOCK_TRAINING_AREA,
     slug: "visitador-medico",
     name: "Visitador Médico",
     shortDescription:
@@ -184,6 +190,7 @@ export const courses: Course[] = [
   },
   {
     id: "c5",
+    trainingArea: MOCK_TRAINING_AREA,
     slug: "certificacion-artesano",
     name: "Certificación como Artesano",
     shortDescription: "Obtén formación y orientación para alcanzar tu certificación como artesano.",

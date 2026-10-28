@@ -71,8 +71,8 @@ services:
         gunicorn --bind 0.0.0.0:5000
         --workers ${GUNICORN_WORKERS:-2}
         --threads ${GUNICORN_THREADS:-8}
-        --max-requests 2000
-        --max-requests-jitter 200
+        --max-requests 20000
+        --max-requests-jitter 5000
         --timeout 600
         --graceful-timeout 60
         --keep-alive 5

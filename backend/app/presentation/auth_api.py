@@ -1,4 +1,5 @@
 import re
+import time
 import uuid
 from datetime import datetime, timezone
 from functools import wraps
@@ -11,16 +12,19 @@ from flask_jwt_extended import (
     unset_jwt_cookies,
 )
 from itsdangerous import BadSignature, URLSafeTimedSerializer
+from limits import parse
 from sqlalchemy.exc import IntegrityError
 
 from app.extensions import client_ip, db, limiter, request_email
 from app.infrastructure.email_service import branded_html, send_html_later
 from app.infrastructure.persistence.models import UserModel, check_dummy_password
+from app.presentation import validation
 
 auth_api = Blueprint("auth", __name__)
 ROLES = {"admin", "teacher", "student"}
-EMAIL_PATTERN = re.compile(r"[^\s@]+@[^\s@]+\.[^\s@]+")
 RESET_TOKEN_MAX_AGE = 30 * 60
+FAILED_LOGINS_PER_ACCOUNT_IP = parse("10 per 15 minutes")
+FAILED_LOGINS_PER_ACCOUNT = parse("50 per hour")
 PASSWORD_MESSAGE = "La contraseña debe tener al menos 8 caracteres, una letra y un número."
 
 
@@ -34,26 +38,26 @@ def json_body():
 
 
 def clean_text(value, max_length):
-    """Trimmed text, "" when missing, or None when it is not text or is too long."""
+    """Trimmed text, "" when missing, or None when it is not text, is too long or has control characters."""
     if value is None:
         return ""
     if not isinstance(value, str):
         return None
     value = value.strip()
-    return value if len(value) <= max_length else None
+    if len(value) > max_length or validation.SINGLE_LINE_FORBIDDEN.search(value):
+        return None
+    return value
 
 
-def person_fields(data):
-    """Validate the fields shared by student registration and teacher creation."""
-    limits = {"firstName": 100, "lastName": 100, "email": 254, "phone": 30, "nationalId": 30}
-    fields = {key: clean_text(data.get(key), limit) for key, limit in limits.items()}
-    if None in fields.values():
-        return None, error("Uno de los campos supera la longitud permitida.")
-    fields["email"] = fields["email"].lower()
-    if not all((fields["firstName"], fields["lastName"], fields["email"], data.get("password"))):
-        return None, error("Completa todos los campos obligatorios.")
-    if not EMAIL_PATTERN.fullmatch(fields["email"]):
-        return None, error("Ingresa un correo electrónico válido.")
+def person_fields(data, *, cedula_required):
+    """Validate the fields shared by student registration and teacher creation (raises ValidationError)."""
+    fields = {
+        "firstName": validation.person_name(data.get("firstName"), "El nombre"),
+        "lastName": validation.person_name(data.get("lastName"), "El apellido"),
+        "email": validation.email(data.get("email")),
+        "phone": validation.phone(data.get("phone")),
+        "nationalId": validation.cedula(data.get("nationalId"), required=cedula_required),
+    }
     if not password_is_valid(data.get("password")):
         return None, error(PASSWORD_MESSAGE)
     if UserModel.query.filter_by(email=fields["email"]).first():
@@ -102,8 +106,8 @@ def issue_session(user, **payload):
 @auth_api.post("/register")
 @limiter.limit(lambda: current_app.config.get("RATELIMIT_REGISTER", "40 per minute;400 per hour"), key_func=client_ip)
 def register():
-    data = json_body()
-    fields, failure = person_fields(data)
+    data = validation.json_object()
+    fields, failure = person_fields(data, cedula_required=True)
     if failure:
         return failure
     user = UserModel(first_name=fields["firstName"], last_name=fields["lastName"], email=fields["email"],
@@ -115,19 +119,66 @@ def register():
     return issue_session(user), 201
 
 
+def seconds_until_reset(strategy, item, keys):
+    return max(1, int(strategy.get_window_stats(item, *keys).reset_time - time.time()))
+
+
+def reserve_login_attempt(email):
+    """Take one attempt from the account's budget before the password is checked.
+
+    The reservation is an atomic counter increment, so concurrent guesses cannot all slip through before
+    the first failure is recorded. The hard lock is keyed by account + IP: an attacker elsewhere cannot
+    lock the real user out with a handful of wrong passwords; a looser per-account cap stops distributed
+    guessing. Returns the seconds to wait, or None when the attempt may proceed.
+    """
+    if not limiter.enabled or not email:
+        return None
+    try:
+        strategy = limiter.limiter
+        account = ("login-account", email)
+        attempt = ("login", email, client_ip())
+        if not strategy.test(FAILED_LOGINS_PER_ACCOUNT, *account):
+            return seconds_until_reset(strategy, FAILED_LOGINS_PER_ACCOUNT, account)
+        if not strategy.hit(FAILED_LOGINS_PER_ACCOUNT_IP, *attempt):
+            return seconds_until_reset(strategy, FAILED_LOGINS_PER_ACCOUNT_IP, attempt)
+    except Exception:
+        # Same policy as the decorators (swallow_errors): a rate-limit storage outage must not block logins.
+        current_app.logger.exception("No se pudo verificar el límite de intentos de inicio de sesión")
+    return None
+
+
+def settle_login_attempt(email, succeeded):
+    if not limiter.enabled or not email:
+        return
+    try:
+        if succeeded:
+            limiter.limiter.clear(FAILED_LOGINS_PER_ACCOUNT_IP, "login", email, client_ip())
+        else:
+            limiter.limiter.hit(FAILED_LOGINS_PER_ACCOUNT, "login-account", email)
+    except Exception:
+        current_app.logger.exception("No se pudo registrar el intento de inicio de sesión")
+
+
 @auth_api.post("/login")
 @limiter.limit(lambda: current_app.config.get("RATELIMIT_LOGIN", "60 per minute;1000 per hour"), key_func=client_ip)
-@limiter.limit("10 per 15 minutes", key_func=request_email, deduct_when=lambda response: response.status_code == 401)
 def login():
     data = json_body()
     email = (clean_text(data.get("email"), 254) or "").lower()
     password = data.get("password") if isinstance(data.get("password"), str) else ""
+    wait = reserve_login_attempt(email)
+    if wait:
+        response = jsonify({"error": "rate_limited", "message": "Demasiados intentos fallidos. Espera unos minutos e inténtalo nuevamente."})
+        response.headers["Retry-After"] = str(wait)
+        return response, 429
     user = UserModel.query.filter_by(email=email).first() if email else None
     if not user:
         check_dummy_password(password)
+        settle_login_attempt(email, succeeded=False)
         return error("Correo o contraseña incorrectos.", 401, "invalid_credentials")
     if not user.check_password(password):
+        settle_login_attempt(email, succeeded=False)
         return error("Correo o contraseña incorrectos.", 401, "invalid_credentials")
+    settle_login_attempt(email, succeeded=True)
     if not user.is_active:
         return error("Esta cuenta se encuentra desactivada.", 403, "inactive_account")
     requested_role = data.get("role")
@@ -151,18 +202,16 @@ def me():
 @role_required("student", "teacher", "admin")
 def update_profile():
     user = db.session.get(UserModel, uuid.UUID(get_jwt_identity()))
-    data = json_body()
-    first_name = clean_text(data.get("firstName"), 100)
-    last_name = clean_text(data.get("lastName"), 100)
-    phone = clean_text(data.get("phone"), 30)
-    if None in (first_name, last_name, phone):
-        return error("Uno de los campos supera la longitud permitida.")
-    if first_name:
-        user.first_name = first_name
-    if last_name:
-        user.last_name = last_name
+    if not user:
+        return error("Sesión no disponible.", 401, "session_invalid")
+    data = validation.json_object()
+    # Blank names keep the current value, as the profile form sends every field.
+    if validation.text(data.get("firstName"), "El nombre", 100):
+        user.first_name = validation.person_name(data["firstName"], "El nombre")
+    if validation.text(data.get("lastName"), "El apellido", 100):
+        user.last_name = validation.person_name(data["lastName"], "El apellido")
     if "phone" in data:
-        user.phone = phone or None
+        user.phone = validation.phone(data.get("phone")) or None
     if data.get("avatarKey") in {"navy", "gold", "emerald", "plum"}:
         user.avatar_key = data["avatarKey"]
     db.session.commit()
@@ -271,11 +320,12 @@ def users():
 @auth_api.post("/teachers")
 @role_required("admin")
 def create_teacher():
-    data = json_body()
-    fields, failure = person_fields(data)
+    data = validation.json_object()
+    fields, failure = person_fields(data, cedula_required=False)
     if failure:
         return failure
-    user = UserModel(first_name=fields["firstName"], last_name=fields["lastName"], email=fields["email"], role="teacher", phone=fields["phone"] or None)
+    user = UserModel(first_name=fields["firstName"], last_name=fields["lastName"], email=fields["email"], role="teacher",
+                     national_id=fields["nationalId"] or None, phone=fields["phone"] or None)
     user.set_password(data["password"])
     failure = save_new_user(user)
     if failure:

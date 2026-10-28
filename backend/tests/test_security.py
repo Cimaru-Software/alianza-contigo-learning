@@ -1,7 +1,10 @@
+import zlib
+
 from app import create_app
 from app.extensions import db
 from app.infrastructure.persistence.models import CourseModel, CourseModuleModel, LessonModel, TrainingAreaModel, UserModel
 from app.presentation import auth_api
+from tests.conftest import cedula
 
 
 class SecurityTestConfig:
@@ -25,13 +28,13 @@ def client(**overrides):
 
 
 def student_payload(email="ana@example.com", **extra):
-    return {"firstName": "Ana", "lastName": "Torres", "email": email, "password": "Seguro123", **extra}
+    return {"firstName": "Ana", "lastName": "Torres", "email": email, "password": "Seguro123", "nationalId": cedula(zlib.crc32(email.encode())), **extra}
 
 
 def test_duplicate_national_id_returns_conflict_instead_of_server_error():
     web = client()
-    assert web.post("/api/v1/auth/register", json=student_payload(nationalId="0102030405")).status_code == 201
-    response = web.post("/api/v1/auth/register", json=student_payload("otra@example.com", nationalId="0102030405"))
+    assert web.post("/api/v1/auth/register", json=student_payload(nationalId="1710034065")).status_code == 201
+    response = web.post("/api/v1/auth/register", json=student_payload("otra@example.com", nationalId="1710034065"))
     assert response.status_code == 409
 
 

@@ -15,7 +15,38 @@ import {
   DialogTrigger,
 } from "@/components/ui/dialog";
 import { api, ApiError } from "@/lib/api";
+import { cedulaError, emailError, firstError, personNameError, phoneError } from "@/lib/validation";
 import type { AuthUser } from "@/contexts/AuthContext";
+
+type TeacherField = "firstName" | "lastName" | "email" | "phone" | "nationalId" | "password";
+const emptyTeacher: Record<TeacherField, string> = {
+  firstName: "",
+  lastName: "",
+  email: "",
+  phone: "",
+  nationalId: "",
+  password: "",
+};
+const teacherFields: Array<{
+  label: string;
+  key: TeacherField;
+  type: string;
+  required: boolean;
+  maxLength: number;
+}> = [
+  { label: "Nombres", key: "firstName", type: "text", required: true, maxLength: 100 },
+  { label: "Apellidos", key: "lastName", type: "text", required: true, maxLength: 100 },
+  { label: "Correo", key: "email", type: "email", required: true, maxLength: 254 },
+  { label: "Teléfono", key: "phone", type: "tel", required: false, maxLength: 30 },
+  { label: "Cédula (opcional)", key: "nationalId", type: "text", required: false, maxLength: 10 },
+  {
+    label: "Contraseña temporal",
+    key: "password",
+    type: "password",
+    required: true,
+    maxLength: 128,
+  },
+];
 
 export function TeacherManagementPage() {
   const [teachers, setTeachers] = useState<AuthUser[]>([]);
@@ -23,13 +54,7 @@ export function TeacherManagementPage() {
   const [loading, setLoading] = useState(true);
   const [listError, setListError] = useState("");
   const [saving, setSaving] = useState(false);
-  const [form, setForm] = useState({
-    firstName: "",
-    lastName: "",
-    email: "",
-    phone: "",
-    password: "",
-  });
+  const [form, setForm] = useState<Record<TeacherField, string>>(emptyTeacher);
   const load = () =>
     api<{ users: AuthUser[] }>("/auth/users?role=teacher")
       .then((d) => {
@@ -46,12 +71,23 @@ export function TeacherManagementPage() {
   async function submit(e: FormEvent) {
     e.preventDefault();
     if (saving) return;
+    const invalid = firstError(
+      personNameError(form.firstName, "El nombre"),
+      personNameError(form.lastName, "El apellido"),
+      emailError(form.email),
+      phoneError(form.phone),
+      cedulaError(form.nationalId, false),
+    );
+    if (invalid) {
+      toast.error(invalid);
+      return;
+    }
     setSaving(true);
     try {
       await api("/auth/teachers", { method: "POST", body: JSON.stringify(form) });
       toast.success("Cuenta de profesor creada");
       setOpen(false);
-      setForm({ firstName: "", lastName: "", email: "", phone: "", password: "" });
+      setForm(emptyTeacher);
       await load();
     } catch (err) {
       toast.error(err instanceof ApiError ? err.message : "No se pudo crear la cuenta.");
@@ -77,20 +113,16 @@ export function TeacherManagementPage() {
               <DialogTitle>Crear cuenta de profesor</DialogTitle>
             </DialogHeader>
             <form onSubmit={submit} className="mt-2 grid gap-4 sm:grid-cols-2">
-              {[
-                ["Nombres", "firstName", "text"],
-                ["Apellidos", "lastName", "text"],
-                ["Correo", "email", "email"],
-                ["Teléfono", "phone", "tel"],
-                ["Contraseña temporal", "password", "password"],
-              ].map(([label, key, type]) => (
+              {teacherFields.map(({ label, key, type, required, maxLength }) => (
                 <div key={key} className={`space-y-2 ${key === "password" ? "sm:col-span-2" : ""}`}>
-                  <Label>{label}</Label>
+                  <Label htmlFor={`teacher-${key}`}>{label}</Label>
                   <Input
+                    id={`teacher-${key}`}
                     type={type}
-                    required={key !== "phone"}
-                    minLength={key === "password" ? 8 : undefined}
-                    value={form[key as keyof typeof form]}
+                    required={required}
+                    minLength={key === "password" ? 8 : 0}
+                    maxLength={maxLength}
+                    value={form[key]}
                     onChange={(e) => setForm({ ...form, [key]: e.target.value })}
                   />
                 </div>

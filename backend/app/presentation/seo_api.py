@@ -2,6 +2,7 @@ from xml.sax.saxutils import escape
 
 from flask import Blueprint, Response, current_app
 
+from app.domain.pricing import final_price
 from app.infrastructure.persistence.models import CourseModel
 
 seo_api = Blueprint("seo", __name__)
@@ -107,7 +108,7 @@ def llms_txt():
     if not courses:
         lines.append("- Próximamente nuevos programas.")
     for course in courses:
-        price = float(course.price) * (100 - course.discount_percent) / 100
+        price = final_price(course.price, course.discount_percent)
         summary = " ".join((course.short_description or "").split())
         details = [
             f"área: {course.training_area.name}",

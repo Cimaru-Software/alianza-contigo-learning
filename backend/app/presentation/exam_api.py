@@ -10,6 +10,7 @@ from app.extensions import db, limiter
 from app.infrastructure.email_service import branded_html, send_html_later
 from app.infrastructure.certificate_pdf import build_certificate_pdf
 from app.infrastructure.persistence.models import ExamAttemptModel, EnrollmentModel, UserModel
+from app.presentation import validation
 from app.presentation.auth_api import role_required
 
 exam_api = Blueprint("exams", __name__)
@@ -189,7 +190,9 @@ def submit_student_exam(enrollment_id):
         return jsonify({"message": "Tu intento anterior todavía está siendo revisado."}), 409
     if not state["canAttempt"]:
         return jsonify({"message": "No tienes intentos disponibles para esta evaluación."}), 409
-    answers = (request.get_json(silent=True) or {}).get("answers") or {}
+    answers = validation.json_object().get("answers") or {}
+    if not isinstance(answers, dict):
+        return jsonify({"message": "Responde todas las preguntas antes de enviar."}), 400
     question_ids = {str(question.id) for question in exam.questions}
     if set(answers.keys()) != question_ids:
         return jsonify({"message": "Responde todas las preguntas antes de enviar."}), 400
@@ -199,9 +202,10 @@ def submit_student_exam(enrollment_id):
     normalized_answers = {}
     for question in exam.questions:
         question_id = str(question.id)
-        try:
-            selected = int(answers[question_id])
-        except (TypeError, ValueError):
+        selected = answers[question_id]
+        if isinstance(selected, str) and selected.isdecimal():
+            selected = int(selected)
+        if isinstance(selected, bool) or not isinstance(selected, int):
             return jsonify({"message": "Una de las respuestas no es válida."}), 400
         if selected < 0 or selected >= len(question.options):
             return jsonify({"message": "Una de las respuestas no es válida."}), 400
@@ -325,7 +329,7 @@ def review_failed_attempt(attempt_id):
         attempt = None
     if not attempt or attempt.status != "PENDING_REVIEW":
         return jsonify({"message": "Esta evaluación ya fue revisada o no existe."}), 400
-    feedback = ((request.get_json(silent=True) or {}).get("feedback") or "").strip()
+    feedback = validation.text(validation.json_object().get("feedback"), "La retroalimentación", 5000, multiline=True)
     if not feedback:
         return jsonify({"message": "Escribe una retroalimentación para el estudiante."}), 400
     attempt.status = "FAILED_REVIEWED"

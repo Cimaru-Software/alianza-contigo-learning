@@ -16,6 +16,7 @@ import { Input } from "@/components/ui/input";
 import { Textarea } from "@/components/ui/textarea";
 import { usePublicCourses } from "@/hooks/use-public-courses";
 import { api, ApiError } from "@/lib/api";
+import { emailError, firstError, personNameError, phoneError } from "@/lib/validation";
 import { ACADEMY_PHONE_DISPLAY, ACADEMY_PHONE_E164, ACADEMY_WHATSAPP_URL } from "@/lib/contact";
 import { Seo } from "@/components/seo/Seo";
 import { breadcrumbJsonLd, ORGANIZATION_ID, SITE_URL } from "@/lib/seo";
@@ -93,6 +94,15 @@ export function ContactPage() {
     event.preventDefault();
     const form = event.currentTarget;
     const data = new FormData(form);
+    const invalid = firstError(
+      personNameError(String(data.get("name") ?? ""), "El nombre"),
+      emailError(String(data.get("email") ?? "")),
+      phoneError(String(data.get("phone") ?? ""), true),
+    );
+    if (invalid) {
+      toast.error(invalid);
+      return;
+    }
     setSending(true);
     try {
       const result = await api<{ message: string }>("/contact", {
@@ -211,7 +221,7 @@ export function ContactPage() {
             <label htmlFor="name" className="mb-2 block text-sm font-medium text-navy">
               Nombre completo
             </label>
-            <Input id="name" name="name" autoComplete="name" required maxLength={160} />
+            <Input id="name" name="name" autoComplete="name" required maxLength={100} />
           </div>
           <div>
             <label htmlFor="email" className="mb-2 block text-sm font-medium text-navy">
@@ -230,7 +240,7 @@ export function ContactPage() {
             <label htmlFor="phone" className="mb-2 block text-sm font-medium text-navy">
               Teléfono
             </label>
-            <Input id="phone" name="phone" type="tel" autoComplete="tel" required maxLength={40} />
+            <Input id="phone" name="phone" type="tel" autoComplete="tel" required maxLength={30} />
           </div>
           <div>
             <label htmlFor="message" className="mb-2 block text-sm font-medium text-navy">

@@ -79,6 +79,8 @@ class LessonModel(db.Model):
     interaction_data = db.Column(db.JSON, nullable=True)
     position = db.Column(db.Integer, nullable=False, default=0)
     module = db.relationship("CourseModuleModel", back_populates="lessons")
+    # Explicit so deleting a lesson removes its progress on any database, not only via PostgreSQL's FK cascade.
+    progress = db.relationship("LessonProgressModel", back_populates="lesson", cascade="all, delete-orphan")
 
 
 class FinalExamModel(db.Model):
@@ -110,7 +112,7 @@ class ExamQuestionModel(db.Model):
 class EnrollmentModel(db.Model):
     __tablename__ = "enrollments"
     id = db.Column(db.Uuid, primary_key=True, default=uuid.uuid4)
-    course_id = db.Column(db.Uuid, db.ForeignKey("courses.id", ondelete="CASCADE"), nullable=False, index=True)
+    course_id = db.Column(db.Uuid, db.ForeignKey("courses.id", ondelete="RESTRICT"), nullable=False, index=True)
     student_id = db.Column(db.Uuid, db.ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
     progress_percent = db.Column(db.Integer, nullable=False, default=0)
     exam_submitted_at = db.Column(db.DateTime(timezone=True), nullable=True)
@@ -133,7 +135,7 @@ class LessonProgressModel(db.Model):
     lesson_id = db.Column(db.Uuid, db.ForeignKey("lessons.id", ondelete="CASCADE"), nullable=False, index=True)
     completed_at = db.Column(db.DateTime(timezone=True), nullable=False, default=lambda: datetime.now(timezone.utc))
     enrollment = db.relationship("EnrollmentModel", back_populates="lesson_progress")
-    lesson = db.relationship("LessonModel")
+    lesson = db.relationship("LessonModel", back_populates="progress")
     __table_args__ = (db.UniqueConstraint("enrollment_id", "lesson_id", name="uq_lesson_progress_enrollment_lesson"),)
 
 
@@ -160,7 +162,7 @@ class PaymentOrderModel(db.Model):
     __tablename__ = "payment_orders"
     id = db.Column(db.Uuid, primary_key=True, default=uuid.uuid4)
     reference = db.Column(db.String(40), nullable=False, unique=True, index=True)
-    course_id = db.Column(db.Uuid, db.ForeignKey("courses.id", ondelete="CASCADE"), nullable=False, index=True)
+    course_id = db.Column(db.Uuid, db.ForeignKey("courses.id", ondelete="RESTRICT"), nullable=False, index=True)
     student_id = db.Column(db.Uuid, db.ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
     payment_method = db.Column(db.String(20), nullable=False)
     provider = db.Column(db.String(30), nullable=False, default="MANUAL")

@@ -14,7 +14,7 @@ export function UserAvatar({
 }: {
   initials: string;
   className?: string;
-  tone?: keyof typeof tones;
+  tone?: keyof typeof tones | undefined;
 }) {
   return (
     <span

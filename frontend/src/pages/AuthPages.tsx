@@ -23,6 +23,7 @@ import { Label } from "@/components/ui/label";
 import { Checkbox } from "@/components/ui/checkbox";
 import { Alert, AlertDescription } from "@/components/ui/alert";
 import { api, ApiError } from "@/lib/api";
+import { cedulaError, emailError, firstError, personNameError, phoneError } from "@/lib/validation";
 import { useAuth, type Role } from "@/contexts/AuthContext";
 import hero from "@/assets/hero.jpg";
 
@@ -147,11 +148,13 @@ function RoleLoginFrame({
               Enseña, acompaña y evalúa desde un solo lugar.
             </h2>
             <div className="mt-10 space-y-4">
-              {[
-                [ClipboardCheck, "Revisa evaluaciones y entrega retroalimentación"],
-                [UsersRound, "Consulta el avance de tus grupos"],
-                [BookOpenCheck, "Personaliza el contenido de tus Programas"],
-              ].map(([Icon, text]) => (
+              {(
+                [
+                  [ClipboardCheck, "Revisa evaluaciones y entrega retroalimentación"],
+                  [UsersRound, "Consulta el avance de tus grupos"],
+                  [BookOpenCheck, "Personaliza el contenido de tus Programas"],
+                ] as const
+              ).map(([Icon, text]) => (
                 <div
                   key={String(text)}
                   className="flex items-center gap-4 border-b border-white/10 pb-4"
@@ -251,7 +254,7 @@ export function LoginPage({ role = "student" }: { role?: Role }) {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
   if (user) return <Navigate to={destinations[user.role]} replace />;
-  const copy =
+  const copy: readonly [string, string, string] =
     role === "admin"
       ? [
           "Acceso administrativo",
@@ -346,6 +349,49 @@ export function LoginPage({ role = "student" }: { role?: Role }) {
   );
 }
 
+type RegisterField = "firstName" | "lastName" | "nationalId" | "phone" | "email";
+const registerFields: Array<{
+  label: string;
+  key: RegisterField;
+  type: string;
+  maxLength: number;
+  inputMode?: "text" | "numeric" | "tel" | "email";
+  autoComplete: string;
+}> = [
+  { label: "Nombres", key: "firstName", type: "text", maxLength: 100, autoComplete: "given-name" },
+  {
+    label: "Apellidos",
+    key: "lastName",
+    type: "text",
+    maxLength: 100,
+    autoComplete: "family-name",
+  },
+  {
+    label: "Cédula",
+    key: "nationalId",
+    type: "text",
+    maxLength: 10,
+    inputMode: "numeric",
+    autoComplete: "off",
+  },
+  {
+    label: "Teléfono",
+    key: "phone",
+    type: "tel",
+    maxLength: 30,
+    inputMode: "tel",
+    autoComplete: "tel",
+  },
+  {
+    label: "Correo electrónico",
+    key: "email",
+    type: "email",
+    maxLength: 254,
+    inputMode: "email",
+    autoComplete: "email",
+  },
+];
+
 export function RegisterPage() {
   const { user, register } = useAuth();
   const navigate = useNavigate();
@@ -360,10 +406,24 @@ export function RegisterPage() {
   });
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
+  const [touched, setTouched] = useState<Partial<Record<RegisterField, boolean>>>({});
   if (user) return <Navigate to={destinations[user.role]} replace />;
+  const fieldErrors: Record<RegisterField, string | null> = {
+    firstName: personNameError(form.firstName, "El nombre"),
+    lastName: personNameError(form.lastName, "El apellido"),
+    nationalId: cedulaError(form.nationalId),
+    phone: phoneError(form.phone, true),
+    email: emailError(form.email),
+  };
   async function submit(e: FormEvent) {
     e.preventDefault();
+    const invalid = firstError(...registerFields.map((field) => fieldErrors[field.key]));
+    if (invalid) {
+      setTouched(Object.fromEntries(registerFields.map((field) => [field.key, true])));
+      return setError(invalid);
+    }
     if (form.password !== form.confirmation) return setError("Las contraseñas no coinciden.");
+    setError("");
     setLoading(true);
     try {
       await register(form);
@@ -386,25 +446,33 @@ export function RegisterPage() {
             <AlertDescription>{error}</AlertDescription>
           </Alert>
         )}
-        {[
-          ["Nombres", "firstName", "text"],
-          ["Apellidos", "lastName", "text"],
-          ["Cédula", "nationalId", "text"],
-          ["Teléfono", "phone", "tel"],
-          ["Correo electrónico", "email", "email"],
-        ].map(([label, key, type]) => (
-          <div key={key} className={`space-y-2 ${key === "email" ? "sm:col-span-2" : ""}`}>
-            <Label htmlFor={key}>{label}</Label>
-            <Input
-              id={key}
-              type={type}
-              value={form[key as keyof typeof form]}
-              onChange={(e) => setForm({ ...form, [key]: e.target.value })}
-              required
-              className="h-11"
-            />
-          </div>
-        ))}
+        {registerFields.map(({ label, key, type, maxLength, inputMode, autoComplete }) => {
+          const fieldError = touched[key] ? fieldErrors[key] : null;
+          return (
+            <div key={key} className={`space-y-2 ${key === "email" ? "sm:col-span-2" : ""}`}>
+              <Label htmlFor={key}>{label}</Label>
+              <Input
+                id={key}
+                type={type}
+                inputMode={inputMode}
+                autoComplete={autoComplete}
+                maxLength={maxLength}
+                value={form[key]}
+                onChange={(e) => setForm({ ...form, [key]: e.target.value })}
+                onBlur={() => setTouched((current) => ({ ...current, [key]: true }))}
+                aria-invalid={Boolean(fieldError)}
+                aria-describedby={fieldError ? `${key}-error` : undefined}
+                required
+                className="h-11"
+              />
+              {fieldError && (
+                <p id={`${key}-error`} className="text-xs text-destructive">
+                  {fieldError}
+                </p>
+              )}
+            </div>
+          );
+        })}
         <div className="space-y-2 sm:col-span-2">
           <Label htmlFor="register-password">Contraseña</Label>
           <PasswordInput

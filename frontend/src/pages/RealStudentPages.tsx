@@ -32,6 +32,7 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { useAuth, type AuthUser } from "@/contexts/AuthContext";
 import { api, ApiError } from "@/lib/api";
+import { firstError, personNameError, phoneError } from "@/lib/validation";
 import { toPublicCourse } from "@/hooks/use-public-courses";
 import type { Course, Enrollment } from "@/types";
 import type { LessonDraft, LmsCourse } from "@/types/lms";
@@ -826,6 +827,15 @@ export function RealProfilePage() {
   const initials = `${profile.firstName[0] ?? ""}${profile.lastName[0] ?? ""}`.toUpperCase();
   async function saveProfile(event: FormEvent) {
     event.preventDefault();
+    const invalid = firstError(
+      personNameError(profile.firstName, "El nombre"),
+      personNameError(profile.lastName, "El apellido"),
+      phoneError(profile.phone),
+    );
+    if (invalid) {
+      toast.error(invalid);
+      return;
+    }
     setSaving(true);
     try {
       await updateProfile(profile);
@@ -838,8 +848,10 @@ export function RealProfilePage() {
   }
   async function changePassword(event: FormEvent) {
     event.preventDefault();
-    if (passwords.next !== passwords.confirm)
-      return toast.error("Las contraseñas nuevas no coinciden.");
+    if (passwords.next !== passwords.confirm) {
+      toast.error("Las contraseñas nuevas no coinciden.");
+      return;
+    }
     setSaving(true);
     try {
       const response = await api<{ message: string }>("/auth/change-password", {

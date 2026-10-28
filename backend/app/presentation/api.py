@@ -2,24 +2,28 @@ from dataclasses import asdict
 
 import os
 import re
+import unicodedata
 import uuid
 from datetime import datetime, timezone
-from decimal import Decimal, InvalidOperation
 
 from flask import Blueprint, current_app, jsonify, request, send_from_directory
 from werkzeug.utils import secure_filename
 from flask_jwt_extended import get_jwt_identity
 from markupsafe import escape
-from sqlalchemy import func
+from sqlalchemy import func, select
 from sqlalchemy.orm import selectinload
 
 from app.application.services.course_service import CourseService
+from app.domain.pricing import final_price
 from app.extensions import client_ip, db, limiter
+from app.presentation import validation
 from app.infrastructure.persistence.models import CourseModel, CourseModuleModel, EnrollmentModel, ExamAttemptModel, ExamQuestionModel, FinalExamModel, LessonModel, LessonProgressModel, PaymentOrderModel, TrainingAreaModel, UserModel
 from app.presentation.auth_api import role_required
 from app.infrastructure.email_service import branded_html, send_html
 
 ALLOWED_UPLOADS = {"pdf", "png", "jpg", "jpeg", "webp", "mp4", "webm"}
+LESSON_TYPES = {"video", "text", "image", "pdf", "file", "interactive"}
+INTERACTION_TYPES = {"multiple_choice", "true_false", "ordering", "matching"}
 # Load a course with everything serialize_course touches in a few queries instead of one per lesson.
 COURSE_TREE = (
     selectinload(CourseModel.training_area),
@@ -52,7 +56,7 @@ def serialize_exam(exam, include_answers=False):
 
 
 def serialize_course(course, detailed=False, include_answers=False, public=False):
-    data = {"id": str(course.id), "slug": course.slug, "name": course.name, "shortDescription": course.short_description, "fullDescription": course.full_description, "coverUrl": course.cover_url, "modality": course.modality, "duration": course.duration, "certification": course.certification, "endorsement": course.endorsement, "price": float(course.price), "discountPercent": course.discount_percent, "finalPrice": round(float(course.price) * (100 - course.discount_percent) / 100, 2), "status": course.status, "modulesCount": len(course.modules), "lessonsCount": sum(len(item.lessons) for item in course.modules), "hasFinalExam": course.final_exam is not None and len(course.final_exam.questions) > 0}
+    data = {"id": str(course.id), "slug": course.slug, "name": course.name, "shortDescription": course.short_description, "fullDescription": course.full_description, "coverUrl": course.cover_url, "modality": course.modality, "duration": course.duration, "certification": course.certification, "endorsement": course.endorsement, "price": float(course.price), "discountPercent": course.discount_percent, "finalPrice": float(final_price(course.price, course.discount_percent)), "status": course.status, "modulesCount": len(course.modules), "lessonsCount": sum(len(item.lessons) for item in course.modules), "hasFinalExam": course.final_exam is not None and len(course.final_exam.questions) > 0}
     data["trainingArea"] = {"id": str(course.training_area.id), "name": course.training_area.name}
     if detailed:
         data["modules"] = [serialize_module(item, public) for item in course.modules]
@@ -83,8 +87,107 @@ def current_exam_status(enrollment):
 
 
 def slugify(value):
-    value = re.sub(r"[^a-z0-9]+", "-", value.strip().lower()).strip("-")
+    # "Gestión Pública" -> "gestion-publica": drop accents before removing what is not a-z or 0-9.
+    ascii_value = unicodedata.normalize("NFKD", value).encode("ascii", "ignore").decode("ascii")
+    value = re.sub(r"[^a-z0-9]+", "-", ascii_value.strip().lower()).strip("-")[:150]
     return value or f"curso-{uuid.uuid4().hex[:8]}"
+
+
+def course_fields(data, *, partial):
+    """Validated course attributes present in the request (all of them when partial is False)."""
+    specs = {
+        "name": ("name", "El nombre del curso", 180, False),
+        "shortDescription": ("short_description", "La descripción corta", 500, False),
+        "fullDescription": ("full_description", "La descripción completa", 20000, True),
+        "coverUrl": ("cover_url", "La portada", 500, False),
+        "modality": ("modality", "La modalidad", 120, False),
+        "duration": ("duration", "La duración", 80, False),
+        "certification": ("certification", "La certificación", 180, False),
+        "endorsement": ("endorsement", "El aval", 180, False),
+    }
+    fields = {}
+    for source, (target, label, max_length, multiline) in specs.items():
+        if partial and source not in data:
+            continue
+        fields[target] = validation.text(data.get(source), label, max_length, required=source == "name", multiline=multiline)
+    if "cover_url" in fields:
+        fields["cover_url"] = validation.safe_url(fields["cover_url"], "La portada")
+    if not partial or "price" in data:
+        fields["price"] = validation.money(data.get("price"))
+    if not partial or "discountPercent" in data:
+        fields["discount_percent"] = validation.integer(data.get("discountPercent"), "El descuento", default=0, minimum=0, maximum=100)
+    return fields
+
+
+def interaction_fields(value, label):
+    """Normalized activity data; an activity that cannot be solved is rejected when it is saved."""
+    if not isinstance(value, dict) or value.get("type") not in INTERACTION_TYPES:
+        raise validation.ValidationError(f"{label}: elige el tipo de actividad interactiva.")
+    kind = value["type"]
+    options = validation.string_list(value.get("options"), f"{label}, opciones", max_items=20, max_length=300)
+    raw_pairs = value.get("pairs") or []
+    if not isinstance(raw_pairs, list) or len(raw_pairs) > 20 or not all(isinstance(pair, dict) for pair in raw_pairs):
+        raise validation.ValidationError(f"{label}: los pares no tienen un formato válido.")
+    pairs = [{"left": validation.text(pair.get("left"), label, 300), "right": validation.text(pair.get("right"), label, 300)} for pair in raw_pairs]
+    if kind == "matching":
+        if len(pairs) < 2 or not all(pair["left"] and pair["right"] for pair in pairs):
+            raise validation.ValidationError(f"{label}: completa al menos dos pares para relacionar.")
+        correct = []
+    else:
+        if len(options) < 2 or not all(options):
+            raise validation.ValidationError(f"{label}: completa al menos dos opciones de la actividad.")
+        correct = validation.index_list(value.get("correctAnswers"), label, size=len(options)) if kind != "ordering" else [0]
+    return {
+        "type": kind,
+        "prompt": validation.text(value.get("prompt"), f"{label}, enunciado", 2000, multiline=True),
+        "options": options,
+        "correctAnswers": correct,
+        "pairs": pairs,
+        "explanation": validation.text(value.get("explanation"), f"{label}, explicación", 2000, multiline=True),
+    }
+
+
+def content_modules(value):
+    """Validated modules and lessons, keeping each item's id so save_content can update it in place."""
+    if value is None:
+        return []
+    if not isinstance(value, list) or len(value) > 100:
+        raise validation.ValidationError("Los módulos no tienen un formato válido.")
+    modules = []
+    for module_index, module in enumerate(value):
+        label = f"Módulo {module_index + 1}"
+        raw_lessons = module.get("lessons") if isinstance(module, dict) else None
+        if raw_lessons is None:
+            raw_lessons = []
+        if not isinstance(module, dict) or not isinstance(raw_lessons, list) or len(raw_lessons) > 200:
+            raise validation.ValidationError(f"{label}: el formato no es válido.")
+        lessons = []
+        for lesson_index, lesson in enumerate(raw_lessons):
+            lesson_label = f"{label}, lección {lesson_index + 1}"
+            if not isinstance(lesson, dict):
+                raise validation.ValidationError(f"{lesson_label}: el formato no es válido.")
+            kind = lesson.get("type") if lesson.get("type") in LESSON_TYPES else "text"
+            lessons.append({
+                "id": str(lesson.get("id") or ""),
+                "title": validation.text(lesson.get("title"), lesson_label, 200),
+                "lesson_type": kind,
+                "content": validation.text(lesson.get("content"), f"{lesson_label}, contenido", 100_000, multiline=True),
+                "media_url": validation.safe_url(lesson.get("mediaUrl"), f"{lesson_label}, archivo") or None,
+                "duration_minutes": validation.integer(lesson.get("durationMinutes"), f"{lesson_label}, duración", default=0, minimum=0, maximum=1440),
+                "is_preview": lesson.get("isPreview") is True,
+                "interaction_data": interaction_fields(lesson.get("interaction"), lesson_label) if kind == "interactive" else None,
+            })
+        modules.append({
+            "id": str(module.get("id") or ""),
+            "title": validation.text(module.get("title"), label, 200),
+            "description": validation.text(module.get("description"), f"{label}, descripción", 5000, multiline=True),
+            "lessons": lessons,
+        })
+    return modules
+
+
+def training_area_name(data):
+    return validation.text(data.get("name"), "El nombre del área de formación", 120, required=True)
 
 
 def create_api_blueprint(course_service: CourseService) -> Blueprint:
@@ -93,24 +196,25 @@ def create_api_blueprint(course_service: CourseService) -> Blueprint:
     @api.get("/health")
     @limiter.exempt
     def health():
+        # Checks the database too, so the container healthcheck reports a lost connection.
+        try:
+            db.session.execute(select(1))
+        except Exception:
+            current_app.logger.exception("Health check: la base de datos no responde")
+            return jsonify({"status": "degraded", "service": "alianza-contigo-api", "database": "unavailable"}), 503
         return jsonify({"status": "ok", "service": "alianza-contigo-api"})
 
     @api.post("/contact")
     @limiter.limit("10 per hour", key_func=client_ip)
     def contact():
-        data = request.get_json(silent=True) or {}
-        name = (data.get("name") or "").strip()
-        email = (data.get("email") or "").strip().lower()
-        phone = (data.get("phone") or "").strip()
-        course_slug = (data.get("courseSlug") or "").strip()
-        message = (data.get("message") or "").strip()
-
-        if not all((name, email, phone, course_slug, message)):
+        data = validation.json_object()
+        name = validation.person_name(data.get("name"), "El nombre")
+        email = validation.email(data.get("email"))
+        phone = validation.phone(data.get("phone"))
+        course_slug = validation.text(data.get("courseSlug"), "El programa", 160, required=True)
+        message = validation.text(data.get("message"), "El mensaje", 3000, required=True, multiline=True)
+        if not phone:
             return jsonify({"message": "Completa todos los campos del formulario."}), 400
-        if len(name) > 160 or len(email) > 254 or len(phone) > 40 or len(message) > 3000:
-            return jsonify({"message": "Uno de los campos supera la longitud permitida."}), 400
-        if not re.fullmatch(r"[^\s@]+@[^\s@]+\.[^\s@]+", email):
-            return jsonify({"message": "Ingresa un correo electrónico válido."}), 400
 
         course = CourseModel.query.filter_by(slug=course_slug, status="ACTIVO").first()
         if course is None:
@@ -154,8 +258,7 @@ def create_api_blueprint(course_service: CourseService) -> Blueprint:
         active_courses = CourseModel.query.filter_by(status="ACTIVO").count()
         enrollments_count = EnrollmentModel.query.count()
         completed_count = EnrollmentModel.query.filter(EnrollmentModel.completed_at.isnot(None)).count()
-        approved_orders = PaymentOrderModel.query.filter_by(status="APPROVED").all()
-        revenue = sum((order.amount or Decimal("0") for order in approved_orders), Decimal("0"))
+        revenue = db.session.query(func.coalesce(func.sum(PaymentOrderModel.amount), 0)).filter(PaymentOrderModel.status == "APPROVED").scalar()
         pending_payments = PaymentOrderModel.query.filter_by(status="PENDING", payment_method="TRANSFER").count()
         pending_evaluations = ExamAttemptModel.query.filter_by(status="PENDING_REVIEW").count()
 
@@ -180,17 +283,17 @@ def create_api_blueprint(course_service: CourseService) -> Blueprint:
             for item_year, item_month in month_keys
         ]
 
-        students_by_course = []
-        for course in CourseModel.query.order_by(CourseModel.name.asc()).all():
-            students_by_course.append(
-                {
-                    "course": course.name,
-                    "students": EnrollmentModel.query.filter_by(course_id=course.id).count(),
-                }
-            )
+        students_by_course = [
+            {"course": name, "students": students}
+            for name, students in db.session.query(CourseModel.name, func.count(EnrollmentModel.id))
+            .outerjoin(EnrollmentModel, EnrollmentModel.course_id == CourseModel.id)
+            .group_by(CourseModel.id, CourseModel.name)
+            .order_by(CourseModel.name.asc())
+        ]
 
         activity = []
-        for enrollment in EnrollmentModel.query.order_by(EnrollmentModel.enrolled_at.desc()).limit(5):
+        recent_enrollments = EnrollmentModel.query.options(selectinload(EnrollmentModel.student), selectinload(EnrollmentModel.course))
+        for enrollment in recent_enrollments.order_by(EnrollmentModel.enrolled_at.desc()).limit(5):
             activity.append(
                 {
                     "id": f"enrollment-{enrollment.id}",
@@ -199,7 +302,7 @@ def create_api_blueprint(course_service: CourseService) -> Blueprint:
                     "createdAt": enrollment.enrolled_at.isoformat(),
                 }
             )
-        for order in PaymentOrderModel.query.order_by(PaymentOrderModel.created_at.desc()).limit(5):
+        for order in PaymentOrderModel.query.options(selectinload(PaymentOrderModel.course)).order_by(PaymentOrderModel.created_at.desc()).limit(5):
             labels = {"PENDING": "Pago pendiente", "APPROVED": "Pago aprobado", "REJECTED": "Pago rechazado"}
             activity.append(
                 {
@@ -252,11 +355,7 @@ def create_api_blueprint(course_service: CourseService) -> Blueprint:
     @api.post("/training-areas")
     @role_required("admin")
     def create_training_area():
-        name = ((request.get_json(silent=True) or {}).get("name") or "").strip()
-        if not name:
-            return jsonify({"message": "El nombre del área de formación es obligatorio."}), 400
-        if len(name) > 120:
-            return jsonify({"message": "El nombre no puede superar los 120 caracteres."}), 400
+        name = training_area_name(validation.json_object())
         if TrainingAreaModel.query.filter(db.func.lower(TrainingAreaModel.name) == name.lower()).first():
             return jsonify({"message": "Ya existe un área de formación con ese nombre."}), 409
         area = TrainingAreaModel(name=name)
@@ -273,9 +372,7 @@ def create_api_blueprint(course_service: CourseService) -> Blueprint:
             area = None
         if area is None:
             return jsonify({"message": "Área de formación no encontrada."}), 404
-        name = ((request.get_json(silent=True) or {}).get("name") or "").strip()
-        if not name or len(name) > 120:
-            return jsonify({"message": "Ingresa un nombre válido de hasta 120 caracteres."}), 400
+        name = training_area_name(validation.json_object())
         duplicate = TrainingAreaModel.query.filter(db.func.lower(TrainingAreaModel.name) == name.lower(), TrainingAreaModel.id != area.id).first()
         if duplicate:
             return jsonify({"message": "Ya existe un área de formación con ese nombre."}), 409
@@ -322,24 +419,24 @@ def create_api_blueprint(course_service: CourseService) -> Blueprint:
     @api.post("/courses")
     @role_required("admin")
     def create_course():
-        data = request.get_json(silent=True) or {}
-        if not (data.get("name") or "").strip():
-            return jsonify({"message": "El nombre del curso es obligatorio."}), 400
+        data = validation.json_object()
+        fields = course_fields(data, partial=False)
         if data.get("status") == "ACTIVO":
             return jsonify({"message": "Primero crea el curso, agrega al menos un módulo y configura su examen final antes de activarlo."}), 400
-        try:
-            area = db.session.get(TrainingAreaModel, uuid.UUID(data.get("trainingAreaId"))) if data.get("trainingAreaId") else None
-        except (ValueError, TypeError):
-            area = None
+        area = db.session.get(TrainingAreaModel, validation.uuid_or_none(data.get("trainingAreaId"))) if validation.uuid_or_none(data.get("trainingAreaId")) else None
         if area is None:
             return jsonify({"message": "Selecciona un área de formación válida."}), 400
-        slug = slugify(data["name"])
+        slug = slugify(fields["name"])
         base = slug
         counter = 2
         while CourseModel.query.filter_by(slug=slug).first():
             slug = f"{base}-{counter}"
             counter += 1
-        course = CourseModel(training_area=area, slug=slug, name=data["name"].strip(), short_description=(data.get("shortDescription") or "").strip(), full_description=data.get("fullDescription") or "", cover_url=data.get("coverUrl") or None, modality=data.get("modality") or "Virtual", duration=data.get("duration") or "A tu ritmo", certification=data.get("certification") or "Certificado de aprobación", endorsement=data.get("endorsement") or "", price=Decimal(str(data.get("price") or 0)), discount_percent=max(0, min(100, int(data.get("discountPercent") or 0))), status=data.get("status") if data.get("status") in {"ACTIVO", "CERRADO"} else "CERRADO")
+        defaults = {"modality": "Virtual", "duration": "A tu ritmo", "certification": "Certificado de aprobación"}
+        for key, value in defaults.items():
+            fields[key] = fields[key] or value
+        fields["cover_url"] = fields["cover_url"] or None
+        course = CourseModel(training_area=area, slug=slug, status="CERRADO", **fields)
         db.session.add(course)
         db.session.flush()
         course.final_exam = FinalExamModel(title="Evaluación final", instructions="Completa la evaluación para finalizar el curso.")
@@ -350,25 +447,18 @@ def create_api_blueprint(course_service: CourseService) -> Blueprint:
     @role_required("admin")
     def update_course(slug):
         course = CourseModel.query.filter_by(slug=slug).first_or_404()
-        data = request.get_json(silent=True) or {}
+        data = validation.json_object()
+        fields = course_fields(data, partial=True)
         if "trainingAreaId" in data:
-            try:
-                area = db.session.get(TrainingAreaModel, uuid.UUID(data["trainingAreaId"]))
-            except (ValueError, TypeError):
-                area = None
+            area_uuid = validation.uuid_or_none(data["trainingAreaId"])
+            area = db.session.get(TrainingAreaModel, area_uuid) if area_uuid else None
             if area is None:
                 return jsonify({"message": "Selecciona un área de formación válida."}), 400
             course.training_area = area
-        for source, target in [("name", "name"), ("shortDescription", "short_description"), ("fullDescription", "full_description"), ("coverUrl", "cover_url"), ("modality", "modality"), ("duration", "duration"), ("certification", "certification"), ("endorsement", "endorsement")]:
-            if source in data:
-                setattr(course, target, data[source])
-        if "price" in data:
-            try:
-                course.price = max(Decimal("0"), Decimal(str(data["price"])))
-            except InvalidOperation:
-                return jsonify({"message": "El precio no es válido."}), 400
-        if "discountPercent" in data:
-            course.discount_percent = max(0, min(100, int(data["discountPercent"])))
+        if "cover_url" in fields:
+            fields["cover_url"] = fields["cover_url"] or None
+        for target, value in fields.items():
+            setattr(course, target, value)
         if data.get("status") in {"ACTIVO", "CERRADO"}:
             if data["status"] == "ACTIVO" and (not course.modules or not course.final_exam or not course.final_exam.questions):
                 return jsonify({"message": "Para activar el curso necesitas al menos un módulo y una pregunta en el examen final."}), 400
@@ -380,6 +470,13 @@ def create_api_blueprint(course_service: CourseService) -> Blueprint:
     @role_required("admin")
     def delete_course(slug):
         course = CourseModel.query.filter_by(slug=slug).first_or_404()
+        # Enrollments and payments are academic and accounting records: never delete them with the course.
+        has_history = (
+            EnrollmentModel.query.filter_by(course_id=course.id).first() is not None
+            or PaymentOrderModel.query.filter_by(course_id=course.id).first() is not None
+        )
+        if has_history:
+            return jsonify({"message": "Este curso tiene estudiantes o pagos registrados y no se puede eliminar. Ciérralo para retirarlo del catálogo."}), 409
         db.session.delete(course)
         db.session.commit()
         return "", 204
@@ -388,16 +485,31 @@ def create_api_blueprint(course_service: CourseService) -> Blueprint:
     @role_required("admin")
     def save_content(slug):
         course = CourseModel.query.filter_by(slug=slug).first_or_404()
-        modules = (request.get_json(silent=True) or {}).get("modules", [])
+        modules = content_modules(validation.json_object().get("modules"))
         if course.status == "ACTIVO" and not modules:
             return jsonify({"message": "Un curso activo debe conservar al menos un módulo."}), 400
-        course.modules.clear()
+        # Update rows in place by id: recreating them would cascade-delete every student's lesson progress.
+        # Ids that do not belong to this course are treated as new items.
+        existing_modules = {str(module.id): module for module in course.modules}
+        existing_lessons = {str(lesson.id): lesson for module in course.modules for lesson in module.lessons}
+        kept_modules = []
         for module_index, module_data in enumerate(modules):
-            module = CourseModuleModel(title=(module_data.get("title") or f"Módulo {module_index + 1}").strip(), description=module_data.get("description") or "", position=module_index)
-            for lesson_index, lesson_data in enumerate(module_data.get("lessons", [])):
-                lesson_type = lesson_data.get("type") if lesson_data.get("type") in {"video", "text", "image", "pdf", "file", "interactive"} else "text"
-                module.lessons.append(LessonModel(title=(lesson_data.get("title") or f"Lección {lesson_index + 1}").strip(), lesson_type=lesson_type, content=lesson_data.get("content") or "", media_url=lesson_data.get("mediaUrl") or None, duration_minutes=max(0, int(lesson_data.get("durationMinutes") or 0)), is_preview=bool(lesson_data.get("isPreview")), interaction_data=lesson_data.get("interaction") if lesson_type == "interactive" else None, position=lesson_index))
-            course.modules.append(module)
+            module = existing_modules.pop(module_data["id"], None) or CourseModuleModel()
+            module.title = module_data["title"] or f"Módulo {module_index + 1}"
+            module.description = module_data["description"]
+            module.position = module_index
+            lessons = []
+            for lesson_index, lesson_data in enumerate(module_data["lessons"]):
+                lesson = existing_lessons.pop(lesson_data["id"], None) or LessonModel()
+                for key, value in lesson_data.items():
+                    if key != "id":
+                        setattr(lesson, key, value)
+                lesson.title = lesson.title or f"Lección {lesson_index + 1}"
+                lesson.position = lesson_index
+                lessons.append(lesson)
+            module.lessons = lessons
+            kept_modules.append(module)
+        course.modules = kept_modules  # modules and lessons left out are deleted (delete-orphan)
         db.session.commit()
         return jsonify(serialize_course(course, True, True))
 
@@ -405,20 +517,31 @@ def create_api_blueprint(course_service: CourseService) -> Blueprint:
     @role_required("admin")
     def save_exam(slug):
         course = CourseModel.query.filter_by(slug=slug).first_or_404()
-        data = request.get_json(silent=True) or {}
-        if not data.get("questions"):
+        data = validation.json_object()
+        raw_questions = data.get("questions")
+        if not raw_questions or not isinstance(raw_questions, list):
             return jsonify({"message": "El examen final debe tener al menos una pregunta."}), 400
-        exam = course.final_exam or FinalExamModel(course=course)
-        exam.title = data.get("title") or "Evaluación final"
-        exam.instructions = data.get("instructions") or ""
-        exam.time_limit_minutes = max(1, int(data.get("timeLimitMinutes") or 45))
-        exam.attempts_allowed = max(1, int(data.get("attemptsAllowed") or 1))
-        exam.passing_score = max(1, min(100, int(data.get("passingScore") or 70)))
-        exam.questions.clear()
-        for index, item in enumerate(data["questions"]):
-            if not (item.get("prompt") or "").strip() or len(item.get("options") or []) < 2 or not item.get("correctAnswers"):
+        if len(raw_questions) > 200:
+            return jsonify({"message": "El examen admite hasta 200 preguntas."}), 400
+        questions = []
+        for index, item in enumerate(raw_questions):
+            label = f"Pregunta {index + 1}"
+            if not isinstance(item, dict):
+                raise validation.ValidationError(f"{label}: el formato no es válido.")
+            prompt = validation.text(item.get("prompt"), label, 2000, multiline=True)
+            options = validation.string_list(item.get("options"), f"{label}, opciones", max_items=10, max_length=500)
+            if not prompt or len(options) < 2 or not all(options):
                 return jsonify({"message": f"Completa la pregunta {index + 1}, sus opciones y respuesta correcta."}), 400
-            exam.questions.append(ExamQuestionModel(prompt=item["prompt"].strip(), question_type="single_choice", options=item["options"], correct_answers=item["correctAnswers"], points=max(1, int(item.get("points") or 1)), position=index))
+            correct = validation.index_list(item.get("correctAnswers"), label, size=len(options))
+            points = validation.integer(item.get("points") or None, f"{label}, puntaje", default=1, minimum=1, maximum=100)
+            questions.append(ExamQuestionModel(prompt=prompt, question_type="single_choice", options=options, correct_answers=correct, points=points, position=index))
+        exam = course.final_exam or FinalExamModel(course=course)
+        exam.title = validation.text(data.get("title"), "El título del examen", 200) or "Evaluación final"
+        exam.instructions = validation.text(data.get("instructions"), "Las instrucciones", 5000, multiline=True)
+        exam.time_limit_minutes = validation.integer(data.get("timeLimitMinutes") or None, "El tiempo límite", default=45, minimum=1, maximum=600)
+        exam.attempts_allowed = validation.integer(data.get("attemptsAllowed") or None, "Los intentos", default=1, minimum=1, maximum=20)
+        exam.passing_score = validation.integer(data.get("passingScore") or None, "El puntaje mínimo", default=70, minimum=1, maximum=100)
+        exam.questions = questions
         db.session.commit()
         return jsonify(serialize_exam(exam, True))
 
@@ -497,7 +620,7 @@ def create_api_blueprint(course_service: CourseService) -> Blueprint:
             lesson = next(item for item in ordered if item.id == lesson_uuid)
             if lesson.lesson_type == "interactive":
                 activity = lesson.interaction_data or {}
-                answer = (request.get_json(silent=True) or {}).get("interactionAnswer")
+                answer = validation.json_object().get("interactionAnswer")
                 activity_type = activity.get("type")
                 if activity_type in {"multiple_choice", "true_false"}:
                     expected = (activity.get("correctAnswers") or [None])[0]

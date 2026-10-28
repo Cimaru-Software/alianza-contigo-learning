@@ -4,6 +4,7 @@ from app.extensions import db
 from app.infrastructure.persistence.models import (
     CourseModel,
     CourseModuleModel,
+    EnrollmentModel,
     ExamQuestionModel,
     FinalExamModel,
     LessonModel,
@@ -101,6 +102,9 @@ def seed_demo_courses():
         if course is None:
             course = CourseModel(slug=spec["slug"])
             db.session.add(course)
+        elif EnrollmentModel.query.filter_by(course_id=course.id).first():
+            # Rebuilding modules would delete the lesson progress of the enrolled students.
+            continue
         course.name = spec["name"]
         course.training_area = training_area
         course.short_description = spec["short_description"]

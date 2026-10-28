@@ -1,4 +1,5 @@
-from flask import Flask, jsonify
+from flask import Flask, jsonify, request
+from werkzeug.exceptions import HTTPException
 from werkzeug.middleware.proxy_fix import ProxyFix
 import os
 
@@ -12,6 +13,7 @@ from app.presentation.auth_api import auth_api
 from app.presentation.payment_api import payment_api
 from app.presentation.exam_api import exam_api
 from app.presentation.seo_api import seo_api
+from app.presentation.validation import SINGLE_LINE_FORBIDDEN, ValidationError
 from app.infrastructure.demo_seed import seed_demo_courses
 
 
@@ -24,6 +26,11 @@ def create_app(config_object=None) -> Flask:
     db.init_app(app)
     migrate.init_app(app, db)
     jwt.init_app(app)
+    # The limiter is module-level because route decorators need it at import time, and init_app()
+    # keeps the previous app's `enabled` flag and default limits. Reset both so every app (tests create
+    # many per process) gets exactly its own configuration.
+    app.config.setdefault("RATELIMIT_ENABLED", True)
+    limiter.limit_manager.set_default_limits([])
     limiter.init_app(app)
 
     @jwt.invalid_token_loader
@@ -45,6 +52,26 @@ def create_app(config_object=None) -> Flask:
     @app.errorhandler(429)
     def too_many_requests(_error):
         return jsonify({"error": "rate_limited", "message": "Recibimos demasiadas solicitudes. Espera un momento e inténtalo nuevamente."}), 429
+
+    @app.errorhandler(ValidationError)
+    def invalid_request(error):
+        return jsonify({"error": error.code, "message": error.message}), error.status
+
+    @app.errorhandler(HTTPException)
+    def http_error(error):
+        messages = {400: "La solicitud no es válida.", 404: "Recurso no encontrado.", 405: "Método no permitido."}
+        return jsonify({"error": error.name.lower().replace(" ", "_"), "message": messages.get(error.code, error.description)}), error.code
+
+    @app.errorhandler(500)
+    def server_error(_error):
+        # Flask already logged the traceback; the client gets the JSON contract instead of an HTML page.
+        return jsonify({"error": "server_error", "message": "Ocurrió un error inesperado. Inténtalo nuevamente."}), 500
+    @app.before_request
+    def reject_control_characters():
+        # NUL and other control characters never belong in a URL; PostgreSQL rejects NUL outright.
+        if any(SINGLE_LINE_FORBIDDEN.search(value) for value in (request.path, *request.args.values())):
+            return jsonify({"error": "invalid_request", "message": "La solicitud no es válida."}), 400
+
     cors.init_app(app, resources={r"/api/*": {"origins": app.config["CORS_ORIGINS"]}}, supports_credentials=True)
 
     repository = SqlAlchemyCourseRepository(db.session, CourseModel)

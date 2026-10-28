@@ -53,7 +53,21 @@ import type {
   TrainingArea,
 } from "@/types/lms";
 
-const emptyCourse = {
+interface CourseForm {
+  name: string;
+  trainingAreaId: string;
+  shortDescription: string;
+  fullDescription: string;
+  coverUrl: string;
+  modality: string;
+  duration: string;
+  certification: string;
+  endorsement: string;
+  price: string | number;
+  discountPercent: string | number;
+  status: string;
+}
+const emptyCourse: CourseForm = {
   name: "",
   trainingAreaId: "",
   shortDescription: "",
@@ -294,7 +308,7 @@ export function CourseAdminList({ teacher = false }: { teacher?: boolean }) {
 export function CourseDataForm() {
   const { slug } = useParams();
   const navigate = useNavigate();
-  const [form, setForm] = useState<Record<string, string | number>>(emptyCourse);
+  const [form, setForm] = useState<CourseForm>(emptyCourse);
   const [loading, setLoading] = useState(Boolean(slug));
   const [saving, setSaving] = useState(false);
   const [uploadingCover, setUploadingCover] = useState(false);
@@ -308,7 +322,20 @@ export function CourseDataForm() {
     if (slug)
       api<LmsCourse>(`/courses/${slug}/author`)
         .then((c) =>
-          setForm({ ...c, trainingAreaId: c.trainingArea.id, coverUrl: c.coverUrl || "" }),
+          setForm({
+            name: c.name,
+            trainingAreaId: c.trainingArea.id,
+            shortDescription: c.shortDescription,
+            fullDescription: c.fullDescription,
+            coverUrl: c.coverUrl || "",
+            modality: c.modality,
+            duration: c.duration,
+            certification: c.certification,
+            endorsement: c.endorsement,
+            price: c.price,
+            discountPercent: c.discountPercent,
+            status: c.status,
+          }),
         )
         .catch(() => toast.error("No se pudo cargar el curso"))
         .finally(() => setLoading(false));
@@ -499,9 +526,9 @@ const newLesson = (type: LessonType): LessonDraft => ({
   mediaUrl: "",
   durationMinutes: 0,
   isPreview: false,
-  interaction:
-    type === "interactive"
-      ? {
+  ...(type === "interactive"
+    ? {
+        interaction: {
           type: "multiple_choice",
           prompt: "",
           options: ["", ""],
@@ -511,8 +538,9 @@ const newLesson = (type: LessonType): LessonDraft => ({
             { left: "", right: "" },
           ],
           explanation: "",
-        }
-      : undefined,
+        },
+      }
+    : {}),
 });
 export function CourseContentBuilder() {
   const { slug = "" } = useParams();
@@ -546,7 +574,12 @@ export function CourseContentBuilder() {
   async function saveContent() {
     setSaving(true);
     try {
-      await api(`/courses/${slug}/content`, { method: "PUT", body: JSON.stringify({ modules }) });
+      const saved = await api<LmsCourse>(`/courses/${slug}/content`, {
+        method: "PUT",
+        body: JSON.stringify({ modules }),
+      });
+      // Keep the ids the server assigned: the next save updates these rows instead of duplicating them.
+      setModules(saved.modules ?? []);
       toast.success("Contenido guardado");
     } catch (e) {
       toast.error(e instanceof ApiError ? e.message : "No se pudo guardar");

@@ -23,6 +23,9 @@ class BaseConfig:
     MAIL_SENDER = os.getenv("MAIL_SENDER", "Alianza Contigo")
     MAIL_RECIPIENT = os.getenv("MAIL_RECIPIENT") or EMAIL_ADDRESS
     FRONTEND_URL = os.getenv("FRONTEND_URL", "http://localhost:5173")
+    # Reject sign-ups whose email domain has no MX/A records (cached per domain, see email_verification).
+    EMAIL_CHECK_DELIVERABILITY = os.getenv("EMAIL_CHECK_DELIVERABILITY", "true").lower() == "true"
+    EMAIL_DNS_TIMEOUT = int(os.getenv("EMAIL_DNS_TIMEOUT", "3"))
     UPLOAD_FOLDER = os.getenv("UPLOAD_FOLDER", "/app/uploads")
     # The global ceiling must accommodate course videos. The upload endpoint applies
     # stricter per-type limits to images and documents.

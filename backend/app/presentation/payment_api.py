@@ -1,4 +1,5 @@
 import os
+import re
 import uuid
 import json
 from urllib.error import HTTPError, URLError
@@ -6,7 +7,6 @@ from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 from html import escape
 from datetime import datetime, timezone
-from decimal import Decimal
 
 from flask import Blueprint, current_app, jsonify, redirect, request
 from flask_jwt_extended import get_jwt_identity
@@ -16,10 +16,13 @@ from werkzeug.utils import secure_filename
 from app.extensions import db, limiter
 from app.infrastructure.email_service import branded_html, send_html_later
 from app.infrastructure.persistence.models import CourseModel, EnrollmentModel, PaymentOrderModel, UserModel
+from app.domain.pricing import final_price as domain_final_price
+from app.presentation import validation
 from app.presentation.auth_api import role_required
 
 payment_api = Blueprint("payments", __name__)
 PROOF_EXTENSIONS = {"pdf", "png", "jpg", "jpeg", "webp"}
+CARD_REFERENCE = re.compile(r"CARD-[0-9A-F]{32}")
 
 
 def current_user():
@@ -27,7 +30,7 @@ def current_user():
 
 
 def final_price(course):
-    return (course.price * Decimal(100 - course.discount_percent) / Decimal(100)).quantize(Decimal("0.01"))
+    return domain_final_price(course.price, course.discount_percent)
 
 
 def serialize_order(order):
@@ -76,8 +79,9 @@ def bank_details():
 @role_required("student")
 def card_checkout():
     student = current_user()
-    data = request.get_json(silent=True) or {}
-    course, failure = ensure_available(data.get("courseSlug"), student)
+    data = validation.json_object()
+    course_slug = validation.text(data.get("courseSlug"), "El curso", 160, required=True)
+    course, failure = ensure_available(course_slug, student)
     if failure:
         return failure
     token = current_app.config.get("PAYPHONE_TOKEN")
@@ -105,11 +109,11 @@ def payphone_result(transaction_id, client_tx_id):
 @limiter.limit("30 per hour")
 @role_required("student")
 def payphone_confirm():
-    data = request.get_json(silent=True) or {}
-    if not isinstance(data, dict):
-        return jsonify({"message": "Datos de confirmación inválidos."}), 400
+    data = validation.json_object()
     client_tx_id = str(data.get("clientTransactionId", ""))
     transaction_id = str(data.get("id", ""))
+    if not CARD_REFERENCE.fullmatch(client_tx_id):
+        return jsonify({"message": "No encontramos esta transacción PayPhone."}), 400
     # Locked so a repeated confirmation (refresh, double click) waits for the first one to finish.
     order = PaymentOrderModel.query.filter_by(reference=client_tx_id, provider="PAYPHONE", student_id=current_user().id).with_for_update().first()
     if not order or not transaction_id.isdecimal() or int(transaction_id) <= 0:
@@ -194,7 +198,7 @@ def transfer_checkout():
         return jsonify({"message": f"El comprobante supera el límite de {max_mb} MB."}), 413
     request.max_content_length = max_mb * 1024 * 1024
     student = current_user()
-    course, failure = ensure_available(request.form.get("courseSlug"), student)
+    course, failure = ensure_available(validation.text(request.form.get("courseSlug"), "El curso", 160, required=True), student)
     if failure:
         return failure
     proof = request.files.get("proof")
@@ -282,7 +286,7 @@ def review_order(order_id):
         order = None
     if not order or order.status != "PENDING" or order.payment_method != "TRANSFER":
         return jsonify({"message": "Este pedido ya fue procesado o no existe."}), 400
-    data = request.get_json(silent=True) or {}
+    data = validation.json_object()
     decision = data.get("decision")
     if decision == "approve":
         order.status = "APPROVED"
@@ -291,7 +295,7 @@ def review_order(order_id):
         subject = "Pago aprobado — Ya puedes comenzar"
         html = branded_html("¡Tu pago fue aprobado!", f"Hola {clean(order.student.first_name)},", f"Tu transferencia para <strong>{clean(order.course.name)}</strong> fue validada. El curso ya está disponible en tu portal.", "Comenzar curso", f'{current_app.config["FRONTEND_URL"]}/app/classroom/{order.course.slug}')
     elif decision == "reject":
-        comment = (data.get("comment") or "").strip()
+        comment = validation.text(data.get("comment"), "El motivo del rechazo", 1000, multiline=True)
         if not comment:
             return jsonify({"message": "Escribe el motivo del rechazo."}), 400
         order.status = "REJECTED"

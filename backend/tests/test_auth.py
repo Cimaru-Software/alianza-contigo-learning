@@ -24,7 +24,7 @@ def client():
 
 def test_student_register_login_and_session():
     web = client()
-    payload = {"firstName": "Ana", "lastName": "Torres", "email": "ana@example.com", "password": "Seguro123"}
+    payload = {"firstName": "Ana", "lastName": "Torres", "email": "ana@example.com", "password": "Seguro123", "nationalId": "1710034065"}
     response = web.post("/api/v1/auth/register", json=payload)
     assert response.status_code == 201
     assert response.json["user"]["role"] == "student"
@@ -36,7 +36,7 @@ def test_student_register_login_and_session():
 
 def test_public_registration_cannot_choose_privileged_role():
     web = client()
-    response = web.post("/api/v1/auth/register", json={"firstName": "Eve", "lastName": "Admin", "email": "eve@example.com", "password": "Seguro123", "role": "admin"})
+    response = web.post("/api/v1/auth/register", json={"firstName": "Eve", "lastName": "Admin", "email": "eve@example.com", "password": "Seguro123", "nationalId": "1710034065", "role": "admin"})
     assert response.json["user"]["role"] == "student"
 
 

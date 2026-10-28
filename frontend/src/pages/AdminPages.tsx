@@ -565,7 +565,8 @@ export function StudentDetail() {
       <section className="surface-card mt-6 p-6">
         <h2 className="font-display font-semibold text-navy">Historial académico</h2>
         <p className="mt-3 text-sm text-muted-foreground">
-          Programas, evaluaciones y certificados del estudiante se mostrarán aquí al conectar la API.
+          Programas, evaluaciones y certificados del estudiante se mostrarán aquí al conectar la
+          API.
         </p>
       </section>
     </Shell>

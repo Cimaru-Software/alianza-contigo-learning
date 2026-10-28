@@ -13,12 +13,14 @@ export function TeacherDashboard() {
         description="Acompaña el aprendizaje y mantén tus revisiones al día."
       />
       <section className="mt-6 grid gap-4 sm:grid-cols-2 xl:grid-cols-4">
-        {[
-          ["Programas activos", "3", BookOpen],
-          ["Estudiantes", "84", Users],
-          ["Por revisar", "7", Clock3],
-          ["Revisadas este mes", "36", CheckCircle2],
-        ].map(([label, value, Icon]) => (
+        {(
+          [
+            ["Programas activos", "3", BookOpen],
+            ["Estudiantes", "84", Users],
+            ["Por revisar", "7", Clock3],
+            ["Revisadas este mes", "36", CheckCircle2],
+          ] as const
+        ).map(([label, value, Icon]) => (
           <article key={String(label)} className="surface-card p-5">
             <Icon className="h-5 w-5 text-gold" />
             <p className="mt-5 text-2xl font-semibold text-navy">{String(value)}</p>

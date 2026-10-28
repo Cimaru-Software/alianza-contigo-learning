@@ -1,0 +1,16 @@
+# Build context for backend/Dockerfile (the repository root). The frontend image uses frontend/.dockerignore.
+# Only backend/ and the certificate logo are needed; everything else slows down or bloats the build.
+.git
+**/node_modules
+**/__pycache__
+**/.pytest_cache
+**/.venv
+**/dist
+**/.coverage
+**/.env
+**/.env.*
+backend/uploads
+qa
+docs
+frontend/*
+!frontend/src/assets/logo_cert.png
